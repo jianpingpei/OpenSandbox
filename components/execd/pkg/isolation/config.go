@@ -62,6 +62,7 @@ var execdConfigEnvBlacklist = []string{
 	"JUPYTER_TOKEN",
 	"EXECD_ISOLATION_CONFIG",
 	"EXECD_ENVS",
+	"OPEN_SANDBOX_LIFECYCLE",
 }
 
 // ExecdConfigEnvBlacklist returns a copy of the execd config env names.

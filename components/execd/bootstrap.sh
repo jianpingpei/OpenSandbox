@@ -35,6 +35,7 @@ _shutdown_children() {
 	if [ -n "${EXECD_PID:-}" ]; then
 		wait "$EXECD_PID" 2>/dev/null || true
 	fi
+	_cleanup_lifecycle_status
 	exit 0
 }
 
@@ -48,6 +49,23 @@ is_truthy() {
 	*) return 1 ;;
 	esac
 }
+
+has_lifecycle_config() {
+	# Keep this in sync with pkg/lifecycle/config.go's transport env, explicit
+	# path env, and default persisted path.
+	[ -n "${OPEN_SANDBOX_LIFECYCLE:-}" ] \
+		|| { [ -n "${EXECD_LIFECYCLE_CONFIG:-}" ] && [ -f "$EXECD_LIFECYCLE_CONFIG" ]; } \
+		|| [ -f /var/execd/lifecycle.toml ]
+}
+
+_cleanup_lifecycle_status() {
+	if [ -n "${LIFECYCLE_STATUS_FILE:-}" ]; then
+		rm -f "$LIFECYCLE_STATUS_FILE"
+		LIFECYCLE_STATUS_FILE=""
+	fi
+}
+
+trap '_cleanup_lifecycle_status' EXIT
 
 _sudo() {
 	if [ "$(id -u)" -eq 0 ]; then
@@ -349,8 +367,76 @@ if is_truthy "${EXECD_INIT:-}"; then
 	exec "$EXECD" --init -- "$@"
 fi
 
-"$EXECD" &
+LIFECYCLE_STATUS_FILE=""
+if has_lifecycle_config; then
+	if ! LIFECYCLE_STATUS_FILE="$(
+		mktemp "${TMPDIR:-/tmp}/execd-lifecycle.XXXXXX" 2>/dev/null \
+			|| mktemp /tmp/execd-lifecycle.XXXXXX 2>/dev/null
+	)"; then
+		echo "error: failed to create lifecycle startup status file" >&2
+		exit 1
+	fi
+	"$EXECD" --lifecycle-startup-status-file "$LIFECYCLE_STATUS_FILE" &
+else
+	"$EXECD" &
+fi
 EXECD_PID=$!
+
+# The same long-running execd starts serving HTTP, executes preStart, then
+# reports the result through this private bootstrap synchronization file.
+if [ -n "$LIFECYCLE_STATUS_FILE" ]; then
+	while [ ! -s "$LIFECYCLE_STATUS_FILE" ]; do
+		_execd_state=""
+		if [ -r "/proc/$EXECD_PID/stat" ]; then
+			_execd_state="$(sed -e 's/^.*) //' -e 's/ .*$//' "/proc/$EXECD_PID/stat" 2>/dev/null || true)"
+		fi
+		if ! kill -0 "$EXECD_PID" 2>/dev/null || [ "$_execd_state" = "Z" ]; then
+			set +e
+			wait "$EXECD_PID"
+			_execd_status=$?
+			set -e
+			EXECD_PID=""
+			_cleanup_lifecycle_status
+			if [ "$_execd_status" -eq 0 ]; then
+				_execd_status=1
+			fi
+			exit "$_execd_status"
+		fi
+		# Execd enforces the configured hook timeout; this loop additionally
+		# exits as soon as the daemon dies before reporting a result.
+		sleep 0.1 2>/dev/null || sleep 1
+	done
+	IFS= read -r _prestart_status < "$LIFECYCLE_STATUS_FILE" || true
+	_cleanup_lifecycle_status
+	case "${_prestart_status:-}" in
+	"" | *[!0-9]*) _prestart_status=1 ;;
+	esac
+	if [ "$_prestart_status" -ne 0 ]; then
+		_forward_signal TERM "$EXECD_PID"
+		(
+			sleep 10 &
+			_sleep_pid=$!
+			trap 'kill "$_sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+			wait "$_sleep_pid"
+			_forward_signal KILL "$EXECD_PID"
+		) &
+		_shutdown_watchdog=$!
+		set +e
+		wait "$EXECD_PID"
+		_execd_status=$?
+		kill "$_shutdown_watchdog" 2>/dev/null || true
+		wait "$_shutdown_watchdog" 2>/dev/null || true
+		set -e
+		EXECD_PID=""
+		echo "error: lifecycle preStart failed (status $_prestart_status, execd exit $_execd_status)" >&2
+		if [ "$_prestart_status" -le 0 ] || [ "$_prestart_status" -gt 255 ]; then
+			_prestart_status=1
+		fi
+		exit "$_prestart_status"
+	fi
+	unset _prestart_status _execd_status
+	unset OPEN_SANDBOX_LIFECYCLE
+fi
 
 "$@" &
 CMD_PID=$!

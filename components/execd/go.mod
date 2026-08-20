@@ -24,6 +24,8 @@ require (
 	k8s.io/client-go v0.34.2
 )
 
+require github.com/robfig/cron/v3 v3.0.1
+
 require (
 	filippo.io/edwards25519 v1.1.1 // indirect
 	github.com/bytedance/sonic v1.11.6 // indirect

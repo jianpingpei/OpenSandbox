@@ -165,6 +165,7 @@ func TestServeHTTPUntilShutdownReturnsAfterContextCancellation(t *testing.T) {
 			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusNoContent)
 			}),
+			func() error { return nil },
 		)
 	}()
 
@@ -184,5 +185,53 @@ func TestServeHTTPUntilShutdownReturnsAfterContextCancellation(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("HTTP server did not stop after shutdown cancellation")
+	}
+}
+
+func TestServeHTTPUntilShutdownServesDuringStartup(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	startupStarted := make(chan struct{})
+	finishStartup := make(chan struct{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveHTTPUntilShutdown(
+			ctx,
+			listener,
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}),
+			func() error {
+				close(startupStarted)
+				<-finishStartup
+				return nil
+			},
+		)
+	}()
+
+	<-startupStarted
+	response, err := http.Get("http://" + listener.Addr().String())
+	if err != nil {
+		close(finishStartup)
+		cancel()
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+
+	close(finishStartup)
+	cancel()
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP server did not stop after startup completed")
 	}
 }
