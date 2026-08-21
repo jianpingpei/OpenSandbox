@@ -65,13 +65,21 @@ func (h Hook) timeout() time.Duration {
 	return time.Duration(h.TimeoutSeconds) * time.Second
 }
 
+// PreStartTimeout returns the effective timeout for the configured preStart
+// hook, or zero when no preStart hook is configured.
+func (c *Config) PreStartTimeout() time.Duration {
+	if c == nil || c.PreStart == nil {
+		return 0
+	}
+	return c.PreStart.timeout()
+}
+
 func (h PeriodicHook) hook() Hook {
 	return Hook{Command: h.Command, TimeoutSeconds: h.TimeoutSeconds}
 }
 
-// LoadConfig loads the persisted config first. On a fresh container it falls
-// back to the injected environment config and atomically materializes TOML so
-// execd restarts within the same container do not depend on process memory.
+// LoadConfig prefers and atomically persists the injected environment config.
+// When the transport is absent, it reads the persisted config instead.
 func LoadConfig() (*Config, error) {
 	raw := strings.TrimSpace(os.Getenv(ConfigEnv))
 	if raw != "" {
@@ -79,9 +87,12 @@ func LoadConfig() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode %s: %w", ConfigEnv, err)
 		}
-		path, err := resolveConfigWritePath()
+		path, err := resolveConfigPath()
 		if err != nil {
 			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, fmt.Errorf("create lifecycle config directory: %w", err)
 		}
 		if err := persistConfig(path, cfg); err != nil {
 			return nil, err
@@ -89,7 +100,10 @@ func LoadConfig() (*Config, error) {
 		return cfg, nil
 	}
 
-	path := resolveConfigReadPath()
+	path, err := resolveConfigPath()
+	if err != nil {
+		return nil, nil //nolint:nilerr,nilnil // no transport and no home means hooks are optional
+	}
 	if raw, err := os.ReadFile(path); err == nil {
 		cfg, decodeErr := decodeConfig(raw)
 		if decodeErr != nil {
@@ -152,11 +166,19 @@ func (c *Config) validate() error {
 			return fmt.Errorf("periodic hook %q schedule must not be blank", periodic.Name)
 		}
 		schedule := periodic.Schedule
+		descriptor := schedule
+		if strings.HasPrefix(descriptor, "TZ=") || strings.HasPrefix(descriptor, "CRON_TZ=") {
+			space := strings.IndexByte(descriptor, ' ')
+			if space < 0 {
+				return fmt.Errorf("periodic hook %q has invalid schedule", periodic.Name)
+			}
+			descriptor = strings.TrimSpace(descriptor[space+1:])
+		}
 		if _, err := cron.ParseStandard(schedule); err != nil {
 			return fmt.Errorf("periodic hook %q has invalid schedule: %w", periodic.Name, err)
 		}
-		if strings.HasPrefix(schedule, "@every ") {
-			interval, err := time.ParseDuration(strings.TrimSpace(strings.TrimPrefix(schedule, "@every ")))
+		if strings.HasPrefix(descriptor, "@every ") {
+			interval, err := time.ParseDuration(strings.TrimSpace(strings.TrimPrefix(descriptor, "@every ")))
 			if err != nil || interval < time.Second || interval%time.Second != 0 {
 				return fmt.Errorf("periodic hook %q @every interval must be a whole number of seconds", periodic.Name)
 			}
@@ -182,37 +204,15 @@ func validateHook(name string, hook Hook) error {
 	return nil
 }
 
-func resolveConfigReadPath() string {
-	if explicit := strings.TrimSpace(os.Getenv(ConfigPathEnv)); explicit != "" {
-		return explicit
+func resolveConfigPath() (string, error) {
+	if configuredPath := os.Getenv(ConfigPathEnv); configuredPath != "" {
+		return configuredPath, nil
 	}
-	return "/var/execd/lifecycle.toml"
-}
-
-func resolveConfigWritePath() (string, error) {
-	path := resolveConfigReadPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("create lifecycle config directory: %w", err)
-	}
-	if !isWritableConfigDir(filepath.Dir(path)) {
-		return "", errors.New("no writable lifecycle config directory")
-	}
-	return path, nil
-}
-
-func isWritableConfigDir(dir string) bool {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return false
-	}
-	probe, err := os.CreateTemp(dir, ".lifecycle-write-probe-*")
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return false
+		return "", fmt.Errorf("resolve lifecycle config home directory: %w", err)
 	}
-	name := probe.Name()
-	defer func() { _ = os.Remove(name) }()
-	closeErr := probe.Close()
-	removeErr := os.Remove(name)
-	return closeErr == nil && removeErr == nil
+	return filepath.Join(home, ".execd", "lifecycle.toml"), nil
 }
 
 func persistConfig(path string, cfg *Config) error {

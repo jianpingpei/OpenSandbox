@@ -262,7 +262,9 @@ func (mp *managedProcess) deliver(ws syscall.WaitStatus) {
 
 func (mp *managedProcess) Wait() error {
 	if initReaper == nil {
-		return waitCommandWithExitBarrier(mp.cmd, func(error) {
+		return waitCommandWithExitBarrier(mp.cmd, func(_ error) {
+			// Success marks exit before reap. A failed barrier cannot prove
+			// ownership, so also disable signaling rather than risk PID reuse.
 			mp.stateMu.Lock()
 			mp.exited = true
 			mp.stateMu.Unlock()
@@ -335,7 +337,11 @@ func withoutHardening() launchOption {
 // never reach the long-lived entrypoint (its Jupyter kernels are user code).
 func bootstrapEnv() launchOption {
 	return func(mp *managedProcess) {
-		mp.stripEnv = []string{"EXECD_ACCESS_TOKEN", "OPEN_SANDBOX_LIFECYCLE"}
+		mp.stripEnv = []string{
+			"EXECD_ACCESS_TOKEN",
+			"OPEN_SANDBOX_LIFECYCLE",
+			"EXECD_LIFECYCLE_CONFIG",
+		}
 	}
 }
 

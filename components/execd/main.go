@@ -49,7 +49,7 @@ const (
 	isolatedRunnerCloseRetryInterval = 100 * time.Millisecond
 )
 
-var errInitStartupShutdown = errors.New("init startup interrupted by shutdown")
+var errStartupShutdown = errors.New("startup interrupted by shutdown")
 
 type isolatedRunnerCloser interface {
 	Close() error
@@ -176,8 +176,8 @@ func run() int {
 		stopInitStartupSignals,
 		lifecycleConfig,
 	); err != nil {
-		if errors.Is(err, errInitStartupShutdown) {
-			log.Info("init: shutdown requested before user entrypoint started")
+		if errors.Is(err, errStartupShutdown) {
+			log.Info("shutdown requested before user entrypoint started: %v", err)
 			return 0
 		}
 		log.Error("execd server stopped with error: %v", err)
@@ -222,20 +222,18 @@ func runHTTPServer(
 		if flag.InitMode {
 			preStartCtx = initStartupCtx
 			if initStartupCtx.Err() != nil {
-				return errInitStartupShutdown
+				return errStartupShutdown
 			}
 		}
-		periodicManager, err = startLifecycle(
+		manager, startErr := startLifecycle(
 			preStartCtx,
 			lifecycleConfig,
 			flag.LifecycleStartupStatusFile,
 		)
-		if err != nil {
-			if flag.InitMode && initStartupCtx.Err() != nil {
-				return errInitStartupShutdown
-			}
-			return err
+		if startErr != nil {
+			return startErr
 		}
+		periodicManager = manager
 		if flag.InitMode {
 			stopInitStartupSignals()
 			if err := startInitEntrypoint(flag.Args()); err != nil {
@@ -253,8 +251,20 @@ func startLifecycle(
 	statusFile string,
 ) (*lifecycle.PeriodicManager, error) {
 	if cfg != nil && cfg.PreStart != nil {
+		if err := appendLifecycleStartupStatus(
+			statusFile,
+			fmt.Sprintf("running %d", int64(cfg.PreStartTimeout()/time.Second)),
+		); err != nil {
+			return nil, err
+		}
 		if err := lifecycle.RunPreStart(ctx, cfg); err != nil {
-			reportErr := writeLifecycleStartupStatus(statusFile, 1)
+			reportErr := appendLifecycleStartupStatus(statusFile, "done 1")
+			if ctxErr := ctx.Err(); reportErr == nil && ctxErr != nil && errors.Is(err, ctxErr) {
+				return nil, errors.Join(
+					errStartupShutdown,
+					fmt.Errorf("lifecycle preStart: %w", err),
+				)
+			}
 			return nil, errors.Join(
 				fmt.Errorf("lifecycle preStart: %w", err),
 				reportErr,
@@ -267,7 +277,7 @@ func startLifecycle(
 		log.Error("lifecycle: periodic hooks disabled: %v", err)
 		periodicManager = nil
 	}
-	if err := writeLifecycleStartupStatus(statusFile, 0); err != nil {
+	if err := appendLifecycleStartupStatus(statusFile, "done 0"); err != nil {
 		if periodicManager != nil {
 			periodicManager.Stop()
 		}
@@ -276,12 +286,22 @@ func startLifecycle(
 	return periodicManager, nil
 }
 
-func writeLifecycleStartupStatus(path string, status int) error {
+func appendLifecycleStartupStatus(path string, status string) error {
 	if path == "" {
 		return nil
 	}
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", status)), 0o600); err != nil {
+	// Bootstrap creates and owns this private channel. Do not recreate a
+	// missing file: its disappearance must fail startup closed on both sides.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open lifecycle startup status: %w", err)
+	}
+	if _, err := fmt.Fprintln(file, status); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("write lifecycle startup status: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close lifecycle startup status: %w", err)
 	}
 	return nil
 }

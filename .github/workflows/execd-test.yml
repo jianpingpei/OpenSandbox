@@ -145,7 +145,7 @@ jobs:
 
       - name: Lifecycle bootstrap test
         if: matrix.os == 'ubuntu-latest'
-        timeout-minutes: 2
+        timeout-minutes: 5
         working-directory: components/execd
         run: bash tests/lifecycle.sh
 

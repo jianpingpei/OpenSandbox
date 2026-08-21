@@ -19,24 +19,36 @@ package lifecycle
 import (
 	"context"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/alibaba/opensandbox/execd/pkg/log"
+	"golang.org/x/sys/windows"
 )
+
+const taskkillTimeout = 2 * time.Second
 
 func prepareCommand(_ *exec.Cmd) {}
 
 func terminateCommand(cmd *exec.Cmd) {
 	if cmd.Process != nil {
-		killCtx, killCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		killCtx, killCancel := context.WithTimeout(context.Background(), taskkillTimeout)
 		defer killCancel()
-		_ = exec.CommandContext(
-			killCtx,
-			"taskkill",
-			"/T",
-			"/F",
-			"/PID",
-			strconv.Itoa(cmd.Process.Pid),
-		).Run()
+		if systemDirectory, err := windows.GetSystemDirectory(); err == nil {
+			if err := exec.CommandContext(
+				killCtx,
+				filepath.Join(systemDirectory, "taskkill.exe"),
+				"/T",
+				"/F",
+				"/PID",
+				strconv.Itoa(cmd.Process.Pid),
+			).Run(); err != nil {
+				log.Warn("lifecycle: terminate Windows process tree for pid %d: %v", cmd.Process.Pid, err)
+			}
+		} else {
+			log.Warn("lifecycle: resolve Windows system directory for taskkill: %v", err)
+		}
 		_ = cmd.Process.Kill()
 	}
 }

@@ -32,7 +32,8 @@ type managedCommand interface {
 }
 
 // RunManagedCommand runs cmd through execd's init-mode-aware child tracker.
-// cancel must terminate cmd and any descendants when ctx is canceled.
+// cancel must promptly terminate cmd and any descendants when ctx is canceled;
+// it may be called while the init reaper lock is held.
 func RunManagedCommand(ctx context.Context, cmd *exec.Cmd, cancel func()) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return -1, err

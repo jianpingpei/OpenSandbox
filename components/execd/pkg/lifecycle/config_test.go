@@ -45,6 +45,46 @@ func TestLoadConfigMaterializesEnvironmentConfig(t *testing.T) {
 	assert.Equal(t, "sync", reloaded.Periodic[0].Name)
 }
 
+func TestLoadConfigMaterializesEnvironmentConfigUnderHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv(ConfigPathEnv, "")
+	t.Setenv(ConfigEnv, `{"preStart":{"command":["true"]}}`)
+
+	cfg, err := LoadConfig()
+
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	require.FileExists(t, filepath.Join(home, ".execd", "lifecycle.toml"))
+}
+
+func TestLoadConfigRejectsUnwritableDefaultPath(t *testing.T) {
+	home := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".execd"), []byte("not a directory"), 0o600))
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv(ConfigPathEnv, "")
+	t.Setenv(ConfigEnv, `{"preStart":{"command":["true"]}}`)
+
+	cfg, err := LoadConfig()
+
+	assert.Nil(t, cfg)
+	require.ErrorContains(t, err, "create lifecycle config directory")
+}
+
+func TestLoadConfigRejectsUnwritableExplicitPath(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(parent, []byte("file"), 0o600))
+	t.Setenv(ConfigPathEnv, filepath.Join(parent, "lifecycle.toml"))
+	t.Setenv(ConfigEnv, `{"preStart":{"command":["true"]}}`)
+
+	cfg, err := LoadConfig()
+
+	assert.Nil(t, cfg)
+	require.ErrorContains(t, err, "create lifecycle config directory")
+}
+
 func TestLoadConfigEnvironmentOverridesPersistedConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lifecycle.toml")
 	require.NoError(t, os.WriteFile(path, []byte(`version = 1
@@ -95,12 +135,28 @@ func TestDecodeConfigNormalizesPeriodicIdentityAndSchedule(t *testing.T) {
 	assert.Equal(t, "@every 1m", cfg.Periodic[0].Schedule)
 }
 
-func TestDecodeConfigRejectsSubSecondEveryInterval(t *testing.T) {
-	_, err := decodeConfig([]byte(`{
-  "periodic": [{"name": "sync", "schedule": "@every 500ms", "command": ["true"]}]
+func TestDecodeConfigRejectsNonWholeSecondEveryInterval(t *testing.T) {
+	for _, schedule := range []string{
+		"@every 500ms",
+		"TZ=UTC @every 500ms",
+		"CRON_TZ=UTC @every 1500ms",
+	} {
+		t.Run(schedule, func(t *testing.T) {
+			_, err := decodeConfig([]byte(`{
+  "periodic": [{"name": "sync", "schedule": "` + schedule + `", "command": ["true"]}]
 }`))
 
-	require.ErrorContains(t, err, `periodic hook "sync" @every interval must be a whole number of seconds`)
+			require.ErrorContains(t, err, `periodic hook "sync" @every interval must be a whole number of seconds`)
+		})
+	}
+}
+
+func TestDecodeConfigRejectsTimezoneWithoutSchedule(t *testing.T) {
+	_, err := decodeConfig([]byte(`{
+  "periodic": [{"name": "sync", "schedule": "TZ=UTC", "command": ["true"]}]
+}`))
+
+	require.ErrorContains(t, err, `periodic hook "sync" has invalid schedule`)
 }
 
 func TestDecodeConfigRejectsOverflowingTimeout(t *testing.T) {
@@ -131,4 +187,24 @@ func TestLoadConfigReturnsNilWhenNotConfigured(t *testing.T) {
 	assert.Nil(t, cfg)
 	_, statErr := os.Stat(os.Getenv(ConfigPathEnv))
 	assert.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
+func TestLoadConfigWithoutHome(t *testing.T) {
+	t.Setenv(ConfigPathEnv, "")
+	t.Setenv(ConfigEnv, "")
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+
+	cfg, err := LoadConfig()
+
+	require.NoError(t, err)
+	assert.Nil(t, cfg)
+
+	t.Setenv(ConfigEnv, `{"preStart":{"command":["true"]}}`)
+	cfg, err = LoadConfig()
+
+	assert.Nil(t, cfg)
+	require.ErrorContains(t, err, "resolve lifecycle config home directory")
 }
