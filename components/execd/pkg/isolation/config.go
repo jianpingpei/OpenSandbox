@@ -63,6 +63,7 @@ var execdConfigEnvBlacklist = []string{
 	"EXECD_ISOLATION_CONFIG",
 	"EXECD_ENVS",
 	"OPEN_SANDBOX_LIFECYCLE",
+	"EXECD_LIFECYCLE_CONFIG",
 }
 
 // ExecdConfigEnvBlacklist returns a copy of the execd config env names.

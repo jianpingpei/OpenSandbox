@@ -90,6 +90,7 @@ func run() int {
 		return 1
 	}
 	_ = os.Unsetenv(lifecycle.ConfigEnv)
+	_ = os.Unsetenv(lifecycle.ConfigPathEnv)
 
 	// Start the eBPF observation layer ([ebpf] enabled, OSEP-0018 §5).
 	// The stub build reports disabled; the execd-ebpf variant attaches the

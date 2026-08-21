@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/runtime"
 )
 
@@ -41,6 +43,7 @@ func RunHook(parent context.Context, hook Hook) Result {
 	defer cancel()
 
 	cmd := exec.Command(hook.Command[0], hook.Command[1:]...)
+	cmd.Env = sanitizedHookEnvironment()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	prepareCommand(cmd)
@@ -54,6 +57,27 @@ func RunHook(parent context.Context, hook Hook) Result {
 	}
 	result.Incomplete = errors.Is(err, runtime.ErrManagedCommandCancelTimeout)
 	return result
+}
+
+func sanitizedHookEnvironment() []string {
+	blocked := make(map[string]struct{})
+	for _, name := range isolation.ExecdConfigEnvBlacklist() {
+		blocked[strings.ToUpper(name)] = struct{}{}
+	}
+
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, found := blocked[strings.ToUpper(name)]; found {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
 }
 
 func RunPreStart(ctx context.Context, cfg *Config) error {

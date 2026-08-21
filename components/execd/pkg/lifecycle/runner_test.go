@@ -18,10 +18,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +51,40 @@ func TestRunHookReturnsExitCode(t *testing.T) {
 	require.Error(t, result.Err)
 	assert.Equal(t, 17, result.ExitCode)
 	assert.False(t, result.TimedOut)
+}
+
+func TestRunHookStripsExecdConfigurationEnvironment(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "hook-env")
+	t.Setenv("LIFECYCLE_HOOK_ENV_HELPER", "1")
+	t.Setenv("LIFECYCLE_HOOK_ENV_MARKER", marker)
+	for _, name := range isolation.ExecdConfigEnvBlacklist() {
+		t.Setenv(name, "secret")
+	}
+
+	result := RunHook(context.Background(), Hook{
+		Command: []string{os.Args[0], "-test.run=TestLifecycleHookEnvironmentHelper"},
+	})
+
+	require.NoError(t, result.Err)
+	raw, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	assert.Empty(t, string(raw))
+}
+
+func TestLifecycleHookEnvironmentHelper(t *testing.T) {
+	if os.Getenv("LIFECYCLE_HOOK_ENV_HELPER") != "1" {
+		return
+	}
+	marker := os.Getenv("LIFECYCLE_HOOK_ENV_MARKER")
+	require.NotEmpty(t, marker)
+
+	leaked := make([]string, 0)
+	for _, name := range isolation.ExecdConfigEnvBlacklist() {
+		if _, ok := os.LookupEnv(name); ok {
+			leaked = append(leaked, name)
+		}
+	}
+	require.NoError(t, os.WriteFile(marker, []byte(strings.Join(leaked, "\n")), 0o600))
 }
 
 func TestRunHookKillsTimedOutProcess(t *testing.T) {

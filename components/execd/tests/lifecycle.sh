@@ -113,6 +113,7 @@ set -e
 test -f "$PRESTART_MARKER"
 test -f "$EXECD_READY_MARKER"
 test -z "${OPEN_SANDBOX_LIFECYCLE:-}"
+test -z "${EXECD_LIFECYCLE_CONFIG:-}"
 test -f "$EXECD_MARKER"
 touch "$USER_MARKER"
 printf 'user\n' >> "$SEQUENCE_FILE"
@@ -270,3 +271,26 @@ test -f "$EXECD_READY_MARKER"
 test -f "$USER_MARKER"
 assert_status_dir_empty
 echo "PASS: persisted lifecycle config triggers preStart"
+
+rm -f "$EXECD_MARKER" "$EXECD_READY_MARKER" "$USER_MARKER" "$SEQUENCE_FILE"
+SANITIZE_USER_SCRIPT="$TESTDIR/sanitize-user.sh"
+cat > "$SANITIZE_USER_SCRIPT" <<'USER'
+#!/bin/sh
+set -e
+test -z "${OPEN_SANDBOX_LIFECYCLE:-}"
+test -z "${EXECD_LIFECYCLE_CONFIG:-}"
+touch "$USER_MARKER"
+USER
+chmod +x "$SANITIZE_USER_SCRIPT"
+OPEN_SANDBOX_LIFECYCLE='' \
+EXECD_LIFECYCLE_CONFIG="$TESTDIR/missing-lifecycle.toml" \
+EXECD="$EXECD_STUB" \
+EXECD_MARKER="$EXECD_MARKER" \
+EXECD_READY_MARKER="$EXECD_READY_MARKER" \
+USER_MARKER="$USER_MARKER" \
+SEQUENCE_FILE="$SEQUENCE_FILE" \
+BOOTSTRAP_CMD="$SANITIZE_USER_SCRIPT" \
+"$BOOTSTRAP"
+
+test -f "$USER_MARKER"
+echo "PASS: internal lifecycle environment is stripped without a configured hook"

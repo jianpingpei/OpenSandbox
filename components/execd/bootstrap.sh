@@ -435,9 +435,9 @@ if [ -n "$LIFECYCLE_STATUS_FILE" ]; then
 		exit "$_prestart_status"
 	fi
 	unset _prestart_status _execd_status
-	unset OPEN_SANDBOX_LIFECYCLE
 fi
 
+unset OPEN_SANDBOX_LIFECYCLE EXECD_LIFECYCLE_CONFIG
 "$@" &
 CMD_PID=$!
 
