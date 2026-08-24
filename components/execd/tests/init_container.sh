@@ -24,6 +24,8 @@
 #     (JUPYTER_TOKEN) while execd's credential (EXECD_ACCESS_TOKEN) is
 #     stripped by the launcher
 #   - on a non-PID-1 topology execd degrades to subreaper and says so
+#   - while preStart is blocked, /ping stays ready and both the entrypoint
+#     and periodic hooks wait; lifecycle transport is stripped from user code
 #
 # Exit-code propagation, runtime SIGTERM forwarding and the rest of the
 # hardening floor are covered by the Python e2e suites
@@ -87,7 +89,7 @@ wait_file() {
 dump_container_logs() {
   local c="$1"
   echo ">> Container logs for ${c}:"
-  docker logs "$c" 2>&1 | grep -E "launcher|landlock|FAIL|init:|hardening|exited" | tail -30 || true
+  docker logs "$c" 2>&1 | grep -E "launcher|landlock|FAIL|init:|hardening|exited|lifecycle|error:" | tail -30 || true
 }
 
 echo "========================================="
@@ -259,10 +261,74 @@ docker rm -f "$C3" >/dev/null
 echo "PASS: subreaper degradation reported"
 
 # -------------------------------------------------------------------
+# Test 4: init mode runs lifecycle hooks before and alongside workload.
+# -------------------------------------------------------------------
+echo ""
+echo ">> Test 4: init-mode lifecycle hooks"
+
+cat > "${TESTDIR}/lifecycle.sh" <<'SCRIPT'
+#!/bin/sh
+set -eu
+out=/mnt/test/lifecycle.out
+touch /mnt/test/entrypoint.started
+[ "$(cat /proc/1/comm)" = "execd" ] || { echo "FAIL: execd is not PID 1" > "$out"; exit 98; }
+[ -f /mnt/test/prestart.done ] || { echo "FAIL: preStart did not finish before entrypoint" > "$out"; exit 99; }
+[ -z "${OPENSANDBOX_LIFECYCLE:-}" ] || { echo "FAIL: lifecycle transport leaked" > "$out"; exit 100; }
+
+i=0
+while [ ! -f /mnt/test/periodic.twice ] && [ "$i" -lt 100 ]; do
+  sleep 0.2
+  i=$((i+1))
+done
+[ -f /mnt/test/periodic.twice ] \
+  || { echo "FAIL: periodic hook did not run twice" > "$out"; exit 101; }
+printf 'lifecycle_hooks_ok=yes\n' > "$out"
+exit 0
+SCRIPT
+chmod +x "${TESTDIR}/lifecycle.sh"
+
+C4="${PREFIX}-t4"
+RUNNERS+=("$C4")
+docker run -d --name "$C4" \
+  --entrypoint /bootstrap.sh \
+  -e EXECD=/execd \
+  -e EXECD_INIT=1 \
+  -e 'OPENSANDBOX_LIFECYCLE={"preStart":{"command":["/bin/sh","-c","touch /mnt/test/prestart.started; while [ ! -f /mnt/test/prestart.release ]; do sleep 0.1; done; touch /mnt/test/prestart.done"],"timeoutSeconds":300},"periodic":[{"name":"checkpoint","schedule":"@every 1s","command":["/bin/sh","-c","touch /mnt/test/periodic.started; echo periodic >> /mnt/test/periodic.sequence; test $(grep -c periodic /mnt/test/periodic.sequence) -ge 2 && touch /mnt/test/periodic.twice || true"]}]}' \
+  -v "${TESTDIR}:/mnt/test" \
+  "${IMAGE}" \
+  /mnt/test/lifecycle.sh >/dev/null
+if ! wait_file "${TESTDIR}/prestart.started"; then
+  dump_container_logs "$C4"
+  fail "test 4: preStart did not reach the startup barrier"
+fi
+if ! docker exec "$C4" /bin/sh -c \
+  'i=0; while [ "$i" -lt 30 ]; do wget -qO- http://127.0.0.1:44772/ping >/dev/null && exit 0; sleep 0.5; i=$((i+1)); done; exit 1'; then
+  dump_container_logs "$C4"
+  fail "test 4: execd /ping was unavailable while preStart was blocked"
+fi
+# Keep the barrier closed across at least one @every 1s tick.
+sleep 2
+[ ! -f "${TESTDIR}/entrypoint.started" ] \
+  || fail "test 4: entrypoint started before preStart was released"
+[ ! -f "${TESTDIR}/periodic.started" ] \
+  || fail "test 4: periodic hook started before preStart was released"
+touch "${TESTDIR}/prestart.release"
+if ! wait_file "${TESTDIR}/lifecycle.out"; then
+  dump_container_logs "$C4"
+  fail "test 4: container did not produce lifecycle.out"
+fi
+RC=$(docker wait "$C4")
+[ "$RC" = "0" ] || fail "test 4: container exited $RC: $(cat "${TESTDIR}/lifecycle.out")"
+grep -q "lifecycle_hooks_ok=yes" "${TESTDIR}/lifecycle.out" \
+  || fail "test 4: lifecycle assertions failed: $(cat "${TESTDIR}/lifecycle.out")"
+docker rm -f "$C4" >/dev/null
+echo "PASS: init-mode health availability, preStart ordering, periodic execution, and environment isolation"
+
+# -------------------------------------------------------------------
 echo ""
 echo "========================================="
 echo " Init-mode container regression PASSED"
 echo "========================================="
 echo "  image: ${IMAGE}"
 echo "  cases: pid1 handoff / reaping / signal shield /"
-echo "         env inheritance / subreaper"
+echo "         env inheritance / subreaper / lifecycle hooks"

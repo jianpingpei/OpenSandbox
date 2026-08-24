@@ -69,17 +69,21 @@ from opensandbox.models.sandboxes import (
 )
 
 
-@pytest.mark.parametrize("hook_type", [DomainLifecycleHook, DomainPeriodicLifecycleHook])
-def test_lifecycle_hooks_reject_timeout_above_maximum(hook_type: type) -> None:
-    kwargs: dict[str, object] = {"command": ["true"], "timeoutSeconds": 300}
+@pytest.mark.parametrize(
+    "hook_type", [DomainLifecycleHook, DomainPeriodicLifecycleHook]
+)
+@pytest.mark.parametrize("timeout_seconds", [0, 301])
+def test_lifecycle_hooks_preserve_timeout_for_server_validation(
+    hook_type: type, timeout_seconds: int
+) -> None:
+    kwargs: dict[str, object] = {
+        "command": ["true"],
+        "timeoutSeconds": timeout_seconds,
+    }
     if hook_type is DomainPeriodicLifecycleHook:
         kwargs.update(name="sync", schedule="@hourly")
 
-    assert hook_type.model_validate(kwargs).timeout_seconds == 300
-
-    kwargs["timeoutSeconds"] = 301
-    with pytest.raises(ValueError, match="less than or equal to 300"):
-        hook_type.model_validate(kwargs)
+    assert hook_type.model_validate(kwargs).timeout_seconds == timeout_seconds
 
 
 def test_lifecycle_hooks_reject_blank_commands_and_normalize_periodic_text() -> None:

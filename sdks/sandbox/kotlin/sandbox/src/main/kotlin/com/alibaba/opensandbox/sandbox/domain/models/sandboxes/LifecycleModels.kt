@@ -16,8 +16,6 @@
 
 package com.alibaba.opensandbox.sandbox.domain.models.sandboxes
 
-private const val MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS = 300
-
 /** Command executed by execd before the user entrypoint starts. */
 class LifecycleHook private constructor(
     val command: List<String>,
@@ -43,9 +41,6 @@ class LifecycleHook private constructor(
         fun command(vararg command: String): Builder = command(command.toList())
 
         fun timeoutSeconds(timeoutSeconds: Int): Builder {
-            require(timeoutSeconds in 1..MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS) {
-                "Lifecycle hook timeoutSeconds must be between 1 and $MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS"
-            }
             this.timeoutSeconds = timeoutSeconds
             return this
         }
@@ -98,9 +93,6 @@ class PeriodicLifecycleHook private constructor(
         fun command(vararg command: String): Builder = command(command.toList())
 
         fun timeoutSeconds(timeoutSeconds: Int): Builder {
-            require(timeoutSeconds in 1..MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS) {
-                "Periodic lifecycle hook timeoutSeconds must be between 1 and $MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS"
-            }
             this.timeoutSeconds = timeoutSeconds
             return this
         }

@@ -77,6 +77,37 @@ public class QuickStart {
 }
 ```
 
+## Lifecycle Hooks
+
+Configure lifecycle hooks on `Sandbox.Builder`. `preStart` completes before the entrypoint starts, while `periodic` hooks run on their schedules after startup.
+
+```java
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.LifecycleHook;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PeriodicLifecycleHook;
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle;
+
+SandboxLifecycle lifecycle = SandboxLifecycle.builder()
+    .preStart(LifecycleHook.builder()
+        .command("sh", "-c", "/opt/hooks/restore.sh")
+        .timeoutSeconds(120)
+        .build())
+    .periodic(PeriodicLifecycleHook.builder()
+        .name("checkpoint")
+        .schedule("@every 5m")
+        .command("sh", "-c", "/opt/hooks/checkpoint.sh")
+        .timeoutSeconds(120)
+        .build())
+    .build();
+
+Sandbox sandbox = Sandbox.builder()
+    .connectionConfig(config)
+    .image("ubuntu:24.04")
+    .lifecycle(lifecycle)
+    .build();
+```
+
+The Server validates `timeoutSeconds`; when omitted it defaults to 60 seconds. See [Lifecycle Hooks](/guides/lifecycle-hooks) for timing, failure behavior, and provider limitations.
+
 ## Usage Examples
 
 ### 1. Lifecycle Management

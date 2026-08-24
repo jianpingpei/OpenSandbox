@@ -33,19 +33,18 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle 
 
 class SandboxLifecycleModelsTest {
     @Test
-    fun `stable lifecycle builders reject timeout above maximum`() {
-        assertEquals(300, DomainLifecycleHook.builder().command("true").timeoutSeconds(300).build().timeoutSeconds)
-
-        assertThrows(IllegalArgumentException::class.java) {
-            DomainLifecycleHook.builder().command("true").timeoutSeconds(301)
-        }
-        assertThrows(IllegalArgumentException::class.java) {
+    fun `stable lifecycle builders preserve timeout for server validation`() {
+        assertEquals(0, DomainLifecycleHook.builder().command("true").timeoutSeconds(0).build().timeoutSeconds)
+        assertEquals(
+            301,
             DomainPeriodicLifecycleHook.builder()
                 .name("sync")
                 .schedule("@hourly")
                 .command("true")
                 .timeoutSeconds(301)
-        }
+                .build()
+                .timeoutSeconds,
+        )
     }
 
     @Test

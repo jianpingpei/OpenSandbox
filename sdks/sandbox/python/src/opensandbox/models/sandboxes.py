@@ -25,8 +25,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-_MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS = 300
-
 
 class SandboxImageAuth(BaseModel):
     """
@@ -168,9 +166,7 @@ class LifecycleHook(BaseModel):
     timeout_seconds: int | None = Field(
         default=None,
         alias="timeoutSeconds",
-        ge=1,
-        le=_MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS,
-        description="Maximum execution time in seconds, up to 300. The server defaults to 60.",
+        description="Maximum execution time in seconds. The server validates the value and defaults to 60.",
     )
 
     @field_validator("command")
@@ -192,9 +188,7 @@ class PeriodicLifecycleHook(BaseModel):
     timeout_seconds: int | None = Field(
         default=None,
         alias="timeoutSeconds",
-        ge=1,
-        le=_MAX_LIFECYCLE_HOOK_TIMEOUT_SECONDS,
-        description="Maximum execution time in seconds, up to 300. The server defaults to 60.",
+        description="Maximum execution time in seconds. The server validates the value and defaults to 60.",
     )
 
     @field_validator("name", "schedule")
