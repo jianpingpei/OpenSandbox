@@ -306,7 +306,7 @@ if ! docker exec "$C4" /bin/sh -c \
   dump_container_logs "$C4"
   fail "test 4: execd /ping was unavailable while preStart was blocked"
 fi
-# Keep the barrier closed across at least one @every 1s tick.
+# Keep the barrier closed long enough to observe an incorrectly started entrypoint or periodic hook.
 sleep 2
 [ ! -f "${TESTDIR}/entrypoint.started" ] \
   || fail "test 4: entrypoint started before preStart was released"
