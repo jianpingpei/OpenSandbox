@@ -182,6 +182,11 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+
+.PHONY: test-e2e-qemu
+test-e2e-qemu: ## Run QEMU-in-runc VMState pause/resume E2E (requires Linux amd64 and /dev/kvm)
+	bash test/e2e_qemu/run.sh
+
 # Common E2E setup targets - install CRDs and controller for any Kind cluster
 .PHONY: install-e2e-deps
 install-e2e-deps:
@@ -587,10 +592,25 @@ helm-test: ## Run Helm chart tests
 	helm test opensandbox-controller --namespace opensandbox-system
 
 .PHONY: helm-docs
-helm-docs: ## Generate Helm chart documentation (requires helm-docs)
+helm-docs: ## Generate Helm chart documentation for all charts (requires helm-docs)
 	@if command -v helm-docs >/dev/null 2>&1; then \
 		echo "Generating Helm chart documentation..."; \
-		helm-docs $(HELM_CHART_PATH); \
+		helm-docs --chart-search-root charts/; \
+	else \
+		echo "helm-docs is not installed. Install it with: go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest"; \
+		exit 1; \
+	fi
+
+.PHONY: helm-docs-check
+helm-docs-check: ## Verify Helm chart documentation is up to date (requires helm-docs)
+	@if command -v helm-docs >/dev/null 2>&1; then \
+		echo "Checking Helm chart documentation is up to date..."; \
+		helm-docs --chart-search-root charts/; \
+		if [ -n "$$(git status --porcelain -- charts/ | head -n 1)" ]; then \
+			echo "ERROR: Helm chart documentation is out of date. Run 'make helm-docs' and commit the changes."; \
+			exit 1; \
+		fi; \
+		echo "Helm chart documentation is up to date."; \
 	else \
 		echo "helm-docs is not installed. Install it with: go install github.com/norwoodj/helm-docs/cmd/helm-docs@latest"; \
 		exit 1; \

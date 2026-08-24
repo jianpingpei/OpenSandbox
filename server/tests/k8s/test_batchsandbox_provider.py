@@ -2712,8 +2712,12 @@ spec:
             "status": {"phase": "Succeed", "conditions": []},
         }
 
-        with pytest.raises(ValueError, match="expected Paused"):
+        with pytest.raises(ValueError) as exc_info:
             provider.resume_sandbox("test-id", "test-ns")
+
+        assert str(exc_info.value) == (
+            "Cannot resume sandbox in state Running, expected Paused"
+        )
 
     def test_get_status_succeed_phase_maps_to_running_state(self):
         provider = BatchSandboxProvider(MagicMock())

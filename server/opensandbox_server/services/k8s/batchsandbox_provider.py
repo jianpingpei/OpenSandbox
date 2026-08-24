@@ -61,6 +61,17 @@ from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
 logger = logging.getLogger(__name__)
 
 
+_PUBLIC_STATE_BY_PHASE = {
+    "Pending": "Pending",
+    "Succeed": "Running",
+    "Running": "Running",
+    "Pausing": "Pausing",
+    "Paused": "Paused",
+    "Resuming": "Resuming",
+    "Failed": "Failed",
+}
+
+
 def _merge_security_context(
     template_sc: Dict[str, Any], runtime_sc: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -775,7 +786,10 @@ class BatchSandboxProvider(WorkloadProvider):
         elif phase == "Pausing":
             raise ValueError(f"Cannot resume: operation in progress (phase={phase})")
         elif phase == "Succeed":
-            raise ValueError(f"Cannot resume sandbox in phase {phase}, expected Paused")
+            public_state = _PUBLIC_STATE_BY_PHASE[phase]
+            raise ValueError(
+                f"Cannot resume sandbox in state {public_state}, expected Paused"
+            )
         elif phase == "Failed":
             if resume_failed:
                 raise ValueError("Cannot resume: sandbox is not available (resume caused pod start failure)")
@@ -865,18 +879,18 @@ class BatchSandboxProvider(WorkloadProvider):
             ["PodFailed", "ResumeFailed", "PauseFailed"],
         )
         phase_map = {
-            "Pending": ("Pending", "CREATING", "Sandbox is being created"),
-            "Succeed": ("Running", "RUNNING", "Sandbox is running"),
-            "Running": ("Running", "RUNNING", "Sandbox is running"),
-            "Pausing": ("Pausing", "PAUSING", "Pausing sandbox"),
-            "Paused": ("Paused", "PAUSED", "Sandbox is paused"),
-            "Resuming": ("Resuming", "RESUMING", "Resuming sandbox"),
-            "Failed": ("Failed", "FAILED", failed_message or "Operation failed"),
+            "Pending": ("CREATING", "Sandbox is being created"),
+            "Succeed": ("RUNNING", "Sandbox is running"),
+            "Running": ("RUNNING", "Sandbox is running"),
+            "Pausing": ("PAUSING", "Pausing sandbox"),
+            "Paused": ("PAUSED", "Sandbox is paused"),
+            "Resuming": ("RESUMING", "Resuming sandbox"),
+            "Failed": ("FAILED", failed_message or "Operation failed"),
         }
         if phase in phase_map:
-            state, reason, message = phase_map[phase]
+            reason, message = phase_map[phase]
             return {
-                "state": state,
+                "state": _PUBLIC_STATE_BY_PHASE[phase],
                 "reason": reason,
                 "message": message,
                 "last_transition_at": creation_timestamp,
