@@ -41,14 +41,14 @@ Lifecycle hooks are part of the sandbox creation request:
   },
   "lifecycle": {
     "preStart": {
-      "command": ["sh", "-c", "/opt/hooks/restore.sh"],
+      "command": ["sh", "-c", "echo ready > /tmp/prestart.done"],
       "timeoutSeconds": 120
     },
     "periodic": [
       {
         "name": "checkpoint",
         "schedule": "@every 5m",
-        "command": ["sh", "-c", "/opt/hooks/checkpoint.sh"],
+        "command": ["sh", "-c", "date -u >> /tmp/checkpoints.log"],
         "timeoutSeconds": 120
       }
     ]
@@ -61,7 +61,7 @@ Lifecycle hooks are part of the sandbox creation request:
 | Field | Required | Description |
 |---|---:|---|
 | `command` | Yes | Non-empty command and argument array |
-| `timeoutSeconds` | No | Server-validated timeout from 1 through 300 seconds; defaults to 60 seconds |
+| `timeoutSeconds` | No | When omitted, defaults to 60 seconds; explicit values must be from 1 through 300 seconds |
 
 `preStart` runs on each container start. Make the command idempotent so retrying or restarting a sandbox does not corrupt its state.
 
@@ -72,7 +72,7 @@ Lifecycle hooks are part of the sandbox creation request:
 | `name` | Yes | Non-blank name, unique within the sandbox |
 | `schedule` | Yes | Standard five-field cron expression or descriptor such as `@hourly` or `@every 30s` |
 | `command` | Yes | Non-empty command and argument array |
-| `timeoutSeconds` | No | Server-validated timeout from 1 through 300 seconds; defaults to 60 seconds |
+| `timeoutSeconds` | No | When omitted, defaults to 60 seconds; explicit values must be from 1 through 300 seconds |
 
 An `@every` interval must be a whole number of seconds and at least one second. Runs of the same named hook never overlap: if the previous run is still active, the next scheduled run is skipped.
 

@@ -79,7 +79,7 @@ await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
     {
         PreStart = new LifecycleHook
         {
-            Command = new[] { "sh", "-c", "/opt/hooks/restore.sh" },
+            Command = new[] { "sh", "-c", "echo ready > /tmp/prestart.done" },
             TimeoutSeconds = 120,
         },
         Periodic = new[]
@@ -88,7 +88,7 @@ await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
             {
                 Name = "checkpoint",
                 Schedule = "@every 5m",
-                Command = new[] { "sh", "-c", "/opt/hooks/checkpoint.sh" },
+                Command = new[] { "sh", "-c", "date -u >> /tmp/checkpoints.log" },
                 TimeoutSeconds = 120,
             },
         },

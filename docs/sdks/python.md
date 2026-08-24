@@ -273,14 +273,14 @@ sandbox = await Sandbox.create(
     connection_config=config,
     lifecycle=SandboxLifecycle(
         pre_start=LifecycleHook(
-            command=["sh", "-c", "/opt/hooks/restore.sh"],
+            command=["sh", "-c", "echo ready > /tmp/prestart.done"],
             timeout_seconds=120,
         ),
         periodic=[
             PeriodicLifecycleHook(
                 name="checkpoint",
                 schedule="@every 5m",
-                command=["sh", "-c", "/opt/hooks/checkpoint.sh"],
+                command=["sh", "-c", "date -u >> /tmp/checkpoints.log"],
                 timeout_seconds=120,
             )
         ],

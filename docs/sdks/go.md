@@ -313,14 +313,14 @@ sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreate
     Image: "ubuntu:24.04",
     Lifecycle: &opensandbox.SandboxLifecycle{
         PreStart: &opensandbox.LifecycleHook{
-            Command:        []string{"sh", "-c", "/opt/hooks/restore.sh"},
+            Command:        []string{"sh", "-c", "echo ready > /tmp/prestart.done"},
             TimeoutSeconds: &hookTimeout,
         },
         Periodic: []opensandbox.PeriodicLifecycleHook{
             {
                 Name:           "checkpoint",
                 Schedule:       "@every 5m",
-                Command:        []string{"sh", "-c", "/opt/hooks/checkpoint.sh"},
+                Command:        []string{"sh", "-c", "date -u >> /tmp/checkpoints.log"},
                 TimeoutSeconds: &hookTimeout,
             },
         },

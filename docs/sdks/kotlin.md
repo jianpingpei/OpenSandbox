@@ -88,13 +88,13 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxLifecycle;
 
 SandboxLifecycle lifecycle = SandboxLifecycle.builder()
     .preStart(LifecycleHook.builder()
-        .command("sh", "-c", "/opt/hooks/restore.sh")
+        .command("sh", "-c", "echo ready > /tmp/prestart.done")
         .timeoutSeconds(120)
         .build())
     .periodic(PeriodicLifecycleHook.builder()
         .name("checkpoint")
         .schedule("@every 5m")
-        .command("sh", "-c", "/opt/hooks/checkpoint.sh")
+        .command("sh", "-c", "date -u >> /tmp/checkpoints.log")
         .timeoutSeconds(120)
         .build())
     .build();

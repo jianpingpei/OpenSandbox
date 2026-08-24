@@ -80,14 +80,14 @@ const sandbox = await Sandbox.create({
   image: "ubuntu:24.04",
   lifecycle: {
     preStart: {
-      command: ["sh", "-c", "/opt/hooks/restore.sh"],
+      command: ["sh", "-c", "echo ready > /tmp/prestart.done"],
       timeoutSeconds: 120,
     },
     periodic: [
       {
         name: "checkpoint",
         schedule: "@every 5m",
-        command: ["sh", "-c", "/opt/hooks/checkpoint.sh"],
+        command: ["sh", "-c", "date -u >> /tmp/checkpoints.log"],
         timeoutSeconds: 120,
       },
     ],
