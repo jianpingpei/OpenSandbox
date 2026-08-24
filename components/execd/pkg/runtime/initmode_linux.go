@@ -446,15 +446,17 @@ func PrepareInitMode() func([]string) error {
 	safego.Go(func() { forwardInitSignalsWhenReady(entryCh, sigCh) })
 
 	return func(entryArgs []string) error {
+		if len(entryArgs) == 0 {
+			log.Warn("init: --init set but no user command provided; no entrypoint to supervise")
+			entryCh <- nil
+			return nil
+		}
 		entry, err := launchEntrypoint(entryArgs)
 		if err != nil {
 			entryCh <- nil
 			return err
 		}
 		entryCh <- entry
-		if entry == nil {
-			return nil
-		}
 		safego.Go(func() { waitEntrypointExit(entry) })
 		return nil
 	}
@@ -487,10 +489,6 @@ func forwardInitSignalsWhenReady(
 }
 
 func launchEntrypoint(args []string) (*managedProcess, error) {
-	if len(args) == 0 {
-		log.Warn("init: --init set but no user command provided; no entrypoint to supervise")
-		return nil, nil
-	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdin = os.Stdin
