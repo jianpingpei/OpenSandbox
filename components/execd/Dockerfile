@@ -155,7 +155,8 @@ COPY components/execd/install.bat ./install.bat
 
 # Defensive: force execd-related files executable for all users regardless
 # of source checkout permissions.
-RUN chmod a+x ./execd ./execd.exe ./execd-ebpf ./opensandbox-supervisor ./bootstrap.sh \
+RUN chmod 0755 ./bootstrap.sh && \
+    chmod a+x ./execd ./execd.exe ./execd-ebpf ./opensandbox-supervisor \
     /usr/local/bin/bwrap \
     /usr/local/libexec/opensandbox-session-gate \
     /opt/opensandbox/opensandbox-session-gate \

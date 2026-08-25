@@ -23,6 +23,7 @@
 #   - with [hardening] enabled, the entrypoint keeps bootstrap env
 #     (JUPYTER_TOKEN) while execd's credential (EXECD_ACCESS_TOKEN) is
 #     stripped by the launcher
+#   - bootstrap.sh remains readable and executable by non-root workloads
 #   - on a non-PID-1 topology execd degrades to subreaper and says so
 #   - while preStart is blocked, /ping stays ready and both the entrypoint
 #     and periodic hooks wait; lifecycle transport is stripped from user code
@@ -111,6 +112,35 @@ else
     . >/dev/null
   echo ">> Image built."
 fi
+
+# -------------------------------------------------------------------
+# Test 0: bootstrap.sh is usable by non-root workload images.
+# -------------------------------------------------------------------
+echo ""
+echo ">> Test 0: non-root bootstrap permissions"
+
+if ! BOOTSTRAP_PERMISSIONS=$(docker run --rm \
+  --user 65534:65534 \
+  --entrypoint /bin/sh \
+  "${IMAGE}" \
+  -c '
+    set -e
+    [ -e /bootstrap.sh ] || { echo "bootstrap.sh is missing" >&2; exit 2; }
+    mode=$(stat -c %a /bootstrap.sh)
+    readable=no
+    executable=no
+    if [ -r /bootstrap.sh ]; then readable=yes; fi
+    if [ -x /bootstrap.sh ]; then executable=yes; fi
+    printf "%s %s %s\n" "$mode" "$readable" "$executable"
+  '); then
+  fail "test 0: failed to inspect bootstrap.sh in the image"
+fi
+read -r BOOTSTRAP_MODE BOOTSTRAP_READABLE BOOTSTRAP_EXECUTABLE <<< "$BOOTSTRAP_PERMISSIONS"
+[ "$BOOTSTRAP_MODE" = "755" ] \
+  || fail "test 0: bootstrap.sh mode is ${BOOTSTRAP_MODE}, expected 755"
+[ "$BOOTSTRAP_READABLE" = "yes" ] && [ "$BOOTSTRAP_EXECUTABLE" = "yes" ] \
+  || fail "test 0: non-root workload cannot read and execute bootstrap.sh"
+echo "PASS: non-root workload can read and execute bootstrap.sh"
 
 # -------------------------------------------------------------------
 # Test 1: execd is PID 1, workload is its child, orphans are reaped,
@@ -330,5 +360,5 @@ echo "========================================="
 echo " Init-mode container regression PASSED"
 echo "========================================="
 echo "  image: ${IMAGE}"
-echo "  cases: pid1 handoff / reaping / signal shield /"
-echo "         env inheritance / subreaper / lifecycle hooks"
+echo "  cases: non-root bootstrap / pid1 handoff / reaping /"
+echo "         signal shield / env inheritance / subreaper / lifecycle hooks"
