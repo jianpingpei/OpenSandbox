@@ -37,6 +37,7 @@ from opensandbox_server.api.schema import (
     Endpoint,
     ListSandboxesRequest,
     ListSandboxesResponse,
+    PatchSandboxMetadataRequest,
     RenewSandboxExpirationRequest,
     RenewSandboxExpirationResponse,
     Sandbox,
@@ -44,7 +45,10 @@ from opensandbox_server.api.schema import (
 )
 from opensandbox_server.config import AppConfig, FleetsRuntimeConfig
 from opensandbox_server.services.constants import SandboxErrorCodes
-from opensandbox_server.services.diagnostics import DiagnosticResult
+from opensandbox_server.services.diagnostics import (
+    DiagnosticResult,
+    unsupported_scope_error,
+)
 from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.fleets.create_mapping import (
     UnsupportedFieldError,
@@ -65,6 +69,8 @@ from opensandbox_server.services.validators import (
     ensure_future_expiration,
     ensure_timeout_within_limit,
 )
+
+_SUPPORTED_EVENT_SCOPES = ("runtime", "all")
 
 
 class FleetSandboxService(SandboxService, ExtensionService):
@@ -313,12 +319,17 @@ class FleetSandboxService(SandboxService, ExtensionService):
                 sandbox_id,
                 int(normalized.timestamp()),
                 expected_uid=current.sandbox.identity.uid,
+                expected_generation=current.generation,
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
         return RenewSandboxExpirationResponse(expiresAt=normalized)
 
-    def patch_sandbox_metadata(self, sandbox_id: str, patch: dict) -> Sandbox:
+    def patch_sandbox_metadata(
+        self,
+        sandbox_id: str,
+        patch: PatchSandboxMetadataRequest,
+    ) -> Sandbox:
         raise self._unsupported(
             "metadata patch until FastPath exposes the fields required by the Sandbox response"
         )
@@ -329,7 +340,20 @@ class FleetSandboxService(SandboxService, ExtensionService):
         raise self._unsupported("sandbox logs")
 
     def get_sandbox_event_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
-        return self._lifecycle_diagnostics(sandbox_id, "events", scope)
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in _SUPPORTED_EVENT_SCOPES:
+            raise unsupported_scope_error("events", scope, _SUPPORTED_EVENT_SCOPES)
+        result = self._lifecycle_diagnostics(sandbox_id, "events", normalized_scope)
+        if normalized_scope == "all":
+            return DiagnosticResult(
+                sandbox_id=result.sandbox_id,
+                kind=result.kind,
+                scope=result.scope,
+                content=result.content,
+                truncated=result.truncated,
+                warnings=("The current backend only contributes runtime events to the all scope.",),
+            )
+        return result
 
     def get_sandbox_logs(
         self,

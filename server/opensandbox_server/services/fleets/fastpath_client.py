@@ -101,8 +101,9 @@ class FastPathClient:
             return
         with self._connect_lock:
             if self._channel is None:
-                self._channel = grpc.insecure_channel(self._endpoint)
-                self._stub = fastpath_pb2_grpc.FastPathServiceStub(self._channel)
+                channel = grpc.insecure_channel(self._endpoint)
+                self._stub = fastpath_pb2_grpc.FastPathServiceStub(channel)
+                self._channel = channel
 
     def close(self) -> None:
         """Close the gRPC channel if open."""

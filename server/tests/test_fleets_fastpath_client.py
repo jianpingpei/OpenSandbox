@@ -18,6 +18,7 @@
 """Focused tests for the synchronous FastPath v2 gRPC adapter."""
 
 from concurrent import futures
+from threading import Event, Thread
 
 import grpc
 import pytest
@@ -225,6 +226,43 @@ def test_error_mapping_covers_common_codes():
         error = fastpath_client._to_fastpath_error(_ScriptedRpcError(code))
         assert isinstance(error, expected)
         assert error.code == code.name
+
+
+def test_concurrent_first_use_waits_for_stub_publication(monkeypatch):
+    channel = object()
+    stub_started = Event()
+    release_stub = Event()
+    errors: list[Exception] = []
+
+    monkeypatch.setattr(grpc, "insecure_channel", lambda _endpoint: channel)
+
+    def build_stub(_channel):
+        stub_started.set()
+        assert release_stub.wait(timeout=5)
+        return object()
+
+    monkeypatch.setattr(fastpath_client.fastpath_pb2_grpc, "FastPathServiceStub", build_stub)
+    client = FastPathClient()
+
+    first = Thread(target=client.connect)
+    second = Thread(target=lambda: _capture_stub_error(client, errors))
+    first.start()
+    assert stub_started.wait(timeout=5)
+    second.start()
+    release_stub.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+
+
+def _capture_stub_error(client: FastPathClient, errors: list[Exception]) -> None:
+    try:
+        client._require_stub()
+    except Exception as exc:  # noqa: BLE001 - the assertion needs the exact failure
+        errors.append(exc)
 
 
 class _ScriptedRpcError(grpc.RpcError):

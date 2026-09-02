@@ -324,7 +324,7 @@ def test_http_renew_and_delete_use_uid_fences(http_fleets):
 
     assert renewed.status_code == 200
     assert fake.last_update.sandbox.expected_uid == f"uid-{sandbox_id}"
-    assert fake.last_update.expected_generation == 0
+    assert fake.last_update.expected_generation == 1
     assert past.status_code == 400
     assert deleted.status_code == 204
     assert fake.last_delete.sandbox.expected_uid == f"uid-{sandbox_id}"
@@ -378,6 +378,21 @@ def test_diagnostics_use_new_structured_state(http_fleets):
 
     fake.diagnostic_runtime_state = 99
     assert '"runtime_state": "99"' in service.get_sandbox_events(sandbox_id)
+
+
+def test_event_diagnostics_enforce_stable_scope_contract(http_fleets):
+    _, _, service = http_fleets
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.get_sandbox_event_diagnostics("flt-1", "lifecycle")
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == {
+        "code": "DIAGNOSTICS_SCOPE_UNSUPPORTED",
+        "message": (
+            "Unsupported events diagnostics scope 'lifecycle'. Supported scopes: runtime, all."
+        ),
+    }
 
 
 @pytest.mark.parametrize("operation", ["logs", "pause", "resume", "endpoint"])
