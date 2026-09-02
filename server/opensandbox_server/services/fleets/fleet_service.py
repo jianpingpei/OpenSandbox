@@ -17,10 +17,8 @@
 
 """FleetSandboxService: fast-sandbox (fleets) runtime backend (OSEP-0007).
 
-Implements the `SandboxService` + `ExtensionService` contracts on top of the
-fast-sandbox FastPath v2 gRPC API. Lifecycle (get/delete/renew/list/metadata),
-execd, and diagnostics reuse the existing public contracts unchanged; Create is
-the simplified subset mapped by `create_mapping`.
+FastPath owns live runtime state. Create echoes request-owned public fields;
+reads that require fields absent from FastPath return FLEETS::API_NOT_SUPPORTED.
 """
 
 from __future__ import annotations
@@ -39,7 +37,6 @@ from opensandbox_server.api.schema import (
     Endpoint,
     ListSandboxesRequest,
     ListSandboxesResponse,
-    PaginationInfo,
     RenewSandboxExpirationRequest,
     RenewSandboxExpirationResponse,
     Sandbox,
@@ -50,7 +47,6 @@ from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.diagnostics import DiagnosticResult
 from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.fleets.create_mapping import (
-    RENEW_EXTEND_SECONDS_METADATA_KEY,
     UnsupportedFieldError,
     map_create_request,
 )
@@ -61,28 +57,24 @@ from opensandbox_server.services.fleets.fastpath_client import (
     FastPathInvalidArgument,
     FastPathNotFound,
     FastPathUnavailable,
-    namespaced_reference,
 )
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
-from opensandbox_server.services.fleets.status_mapping import (
-    RESERVED_METADATA_KEYS,
-    map_sandbox,
-    map_state,
-)
+from opensandbox_server.services.fleets.status_mapping import map_reason, map_state
 from opensandbox_server.services.sandbox_service import SandboxService
 from opensandbox_server.services.validators import (
     ensure_future_expiration,
     ensure_timeout_within_limit,
 )
 
-#: FastPath page size used while exhausting list pages.
-_FASTPATH_PAGE_SIZE = 200
-
 
 class FleetSandboxService(SandboxService, ExtensionService):
     """sandbox fleets runtime backed by the fast-sandbox FastPath v2 API."""
 
-    def __init__(self, config: AppConfig, fastpath_client: Optional[FastPathClient] = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        fastpath_client: Optional[FastPathClient] = None,
+    ):
         self._app_config = config
         fleets_config = config.fleets or FleetsRuntimeConfig()
         self._fleets = fleets_config
@@ -91,6 +83,10 @@ class FleetSandboxService(SandboxService, ExtensionService):
             timeout_seconds=fleets_config.fastpath_timeout_seconds,
         )
         self._tenant_provider = None  # type: ignore[assignment]
+
+    @staticmethod
+    def generate_sandbox_id() -> str:
+        return f"flt-{SandboxService.generate_sandbox_id()}"
 
     def set_tenant_provider(self, provider: object) -> None:
         """Inject the tenant provider (tenant -> fast-sandbox namespace mapping)."""
@@ -120,20 +116,26 @@ class FleetSandboxService(SandboxService, ExtensionService):
         if tenant is not None:
             return tenant.namespace
 
+        namespaces = [self._fleets.namespace]
         if self._tenant_provider is not None:
-            for entry in self._tenant_provider.list_tenants():
-                if entry.namespace == self._fleets.namespace:
-                    continue
-                try:
-                    self._fastpath.get_sandbox(entry.namespace, sandbox_id)
-                except FastPathError:
-                    continue
-                return entry.namespace
+            namespaces.extend(
+                entry.namespace
+                for entry in self._tenant_provider.list_tenants()
+                if entry.namespace != self._fleets.namespace
+            )
+        for namespace in namespaces:
+            try:
+                self._fastpath.get_sandbox(namespace, sandbox_id)
+            except FastPathNotFound:
+                continue
+            except FastPathError as exc:
+                raise self._fastpath_http_error(exc) from exc
+            return namespace
 
         return self._fleets.namespace
 
-    def _pool_resources(self, namespace: str, pool_ref: str) -> Optional[dict]:
-        """Return the SandboxPool profile as resource dict, or None when unknown."""
+    def _pool_resources(self, namespace: str, pool_ref: str) -> dict:
+        """Return the resource profile declared by the selected SandboxPool."""
         try:
             pool = self._fastpath.get_pool(namespace, pool_ref)
         except FastPathNotFound:
@@ -153,7 +155,7 @@ class FleetSandboxService(SandboxService, ExtensionService):
             resources["memory"] = pool.sandbox_memory
         if pool.sandbox_pids:
             resources["pids"] = str(pool.sandbox_pids)
-        return resources or None
+        return resources
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -171,10 +173,11 @@ class FleetSandboxService(SandboxService, ExtensionService):
         return await asyncio.to_thread(self._create_sandbox_sync, request)
 
     def _create_sandbox_sync(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
+        created_at = datetime.now(timezone.utc)
         try:
             create_request = map_create_request(
                 request,
-                sandbox_id=SandboxService.generate_sandbox_id(),
+                sandbox_id=self.generate_sandbox_id(),
                 namespace=self._resolve_namespace(),
                 default_pool_ref=self._fleets.default_pool_ref,
             )
@@ -190,27 +193,31 @@ class FleetSandboxService(SandboxService, ExtensionService):
         namespace = create_request.namespace
         sandbox_id = create_request.request_id
         pool_resources = self._pool_resources(namespace, create_request.pool_ref)
-        if pool_resources is not None:
-            try:
-                create_request = map_create_request(
-                    request,
-                    sandbox_id=sandbox_id,
-                    namespace=namespace,
-                    default_pool_ref=self._fleets.default_pool_ref,
-                    expires_at_unix_seconds=create_request.expires_at_unix_seconds,
-                    pool_resources=pool_resources,
-                )
-            except UnsupportedFieldError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "code": SandboxErrorCodes.INVALID_PARAMETER,
-                        "message": str(exc),
-                    },
-                ) from exc
+        try:
+            create_request = map_create_request(
+                request,
+                sandbox_id=sandbox_id,
+                namespace=namespace,
+                default_pool_ref=self._fleets.default_pool_ref,
+                expires_at_unix_seconds=create_request.expires_at_unix_seconds,
+                pool_resources=pool_resources,
+            )
+        except UnsupportedFieldError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": str(exc),
+                },
+            ) from exc
 
         try:
-            info = self._fastpath.create_sandbox(create_request)
+            response = self._fastpath.create_sandbox(
+                create_request,
+                wait_timeout_millis=self._fleets.wait_ready_timeout_millis,
+            )
+        except (FastPathInvalidArgument, FastPathConflict, FastPathNotFound) as exc:
+            raise self._fastpath_http_error(exc) from exc
         except FastPathError as exc:
             # Post-persistence failure recovery: if durable intent exists for
             # the same namespaced id, the create was accepted; return it as
@@ -219,95 +226,53 @@ class FleetSandboxService(SandboxService, ExtensionService):
                 existing = self._fastpath.get_sandbox(namespace, sandbox_id)
             except FastPathError:
                 raise self._fastpath_http_error(exc) from exc
-            return self._build_create_response(request, existing)
+            info = existing.sandbox
+        else:
+            info = response.sandbox
 
-        try:
-            info = self._fastpath.wait_sandbox_ready(
-                namespaced_reference(namespace, sandbox_id),
-                data_plane=True,
-                wait_timeout_millis=self._fleets.wait_ready_timeout_millis,
-            )
-        except FastPathError:
-            # Data plane not ready within the bounded wait: still accepted.
-            info = self._fastpath.get_sandbox(namespace, sandbox_id)
-
-        return self._build_create_response(request, info)
+        return self._build_create_response(
+            request,
+            info,
+            sandbox_id=sandbox_id,
+            created_at=created_at,
+            expires_at=datetime.fromtimestamp(
+                create_request.expires_at_unix_seconds, tz=timezone.utc
+            ),
+        )
 
     def _build_create_response(
-        self, request: CreateSandboxRequest, info: pb2.SandboxInfo
+        self,
+        request: CreateSandboxRequest,
+        info: pb2.SandboxInfo,
+        *,
+        sandbox_id: str,
+        created_at: datetime,
+        expires_at: datetime,
     ) -> CreateSandboxResponse:
-        metadata = None
-        if info.metadata:
-            metadata = {
-                key: value
-                for key, value in info.metadata.items()
-                if key not in RESERVED_METADATA_KEYS
-            }
-            if not metadata:
-                metadata = None
         return CreateSandboxResponse(
-            id=info.sandbox_name,
-            status=SandboxStatus(state=map_state(info)),
-            metadata=metadata,
-            expiresAt=_to_datetime(info.expires_at_unix_seconds),
-            createdAt=_to_datetime(info.created_at_unix_seconds),
+            id=sandbox_id,
+            status=SandboxStatus(
+                state=map_state(info),
+                reason=map_reason(info),
+                message=None,
+                lastTransitionAt=None,
+            ),
+            metadata=request.metadata,
+            extensions=request.extensions,
+            platform=None,
+            expiresAt=expires_at,
+            createdAt=created_at,
             entrypoint=request.entrypoint,
         )
 
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
-        """Get a sandbox; a missing CRD maps to HTTP 404."""
-        try:
-            info = self._fastpath.get_sandbox(self._resolve_namespace_for_lookup(sandbox_id), sandbox_id)
-        except FastPathNotFound as exc:
-            raise self._fastpath_http_error(exc) from exc
-        except FastPathError as exc:
-            raise self._fastpath_http_error(exc) from exc
-        return map_sandbox(info)
+        raise self._unsupported(
+            "get sandbox until FastPath exposes the fields required by the Sandbox response"
+        )
 
     def list_sandboxes(self, request: ListSandboxesRequest) -> ListSandboxesResponse:
-        """List sandboxes with OpenSandbox state filtering and pagination.
-
-        FastPath paginates by continue token without state mapping; exhaust
-        all pages, apply state/metadata filters, then compute the requested
-        page and totals (O(total), acceptable for Phase 1a).
-        """
-        namespace = self._resolve_namespace()
-        metadata_filter = request.filter.metadata or {}
-        page_token = ""
-        items: list[Sandbox] = []
-        while True:
-            response = self._fastpath.list_sandboxes(
-                namespace,
-                metadata=metadata_filter or None,
-                page_size=_FASTPATH_PAGE_SIZE,
-                page_token=page_token or None,
-            )
-            items.extend(map_sandbox(info) for info in response.items)
-            page_token = response.next_page_token
-            if not page_token:
-                break
-
-        state_filter = set(request.filter.state or [])
-        if state_filter:
-            items = [s for s in items if s.status.state in state_filter]
-
-        pagination = request.pagination
-        page = pagination.page if pagination else 1
-        page_size = pagination.page_size if pagination else 20
-        total = len(items)
-        total_pages = (total + page_size - 1) // page_size
-        start = (page - 1) * page_size
-        page_items = items[start : start + page_size]
-
-        return ListSandboxesResponse(
-            items=page_items,
-            pagination=PaginationInfo(
-                page=page,
-                pageSize=page_size,
-                totalItems=total,
-                totalPages=total_pages,
-                hasNextPage=page < total_pages,
-            ),
+        raise self._unsupported(
+            "list sandboxes until FastPath exposes the fields required by Sandbox responses"
         )
 
     def delete_sandbox(self, sandbox_id: str) -> None:
@@ -315,11 +280,15 @@ class FleetSandboxService(SandboxService, ExtensionService):
         async (finalizer-driven) deletion."""
         namespace = self._resolve_namespace_for_lookup(sandbox_id)
         try:
-            self._fastpath.get_sandbox(namespace, sandbox_id)
+            current = self._fastpath.get_sandbox(namespace, sandbox_id)
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
         try:
-            self._fastpath.delete_sandbox(namespace, sandbox_id)
+            self._fastpath.delete_sandbox(
+                namespace,
+                sandbox_id,
+                expected_uid=current.sandbox.identity.uid,
+            )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
 
@@ -338,56 +307,28 @@ class FleetSandboxService(SandboxService, ExtensionService):
         namespace = self._resolve_namespace_for_lookup(sandbox_id)
         normalized = ensure_future_expiration(request.expires_at)
         try:
-            info = self._fastpath.update_expiration(
-                namespace, sandbox_id, int(normalized.timestamp())
+            current = self._fastpath.get_sandbox(namespace, sandbox_id)
+            self._fastpath.update_expiration(
+                namespace,
+                sandbox_id,
+                int(normalized.timestamp()),
+                expected_uid=current.sandbox.identity.uid,
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
-        expires = _to_datetime(info.expires_at_unix_seconds)
-        if expires is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "code": SandboxErrorCodes.FLEETS_API_ERROR,
-                    "message": "FastPath did not return the renewed expiration.",
-                },
-            )
-        return RenewSandboxExpirationResponse(expiresAt=expires)
+        return RenewSandboxExpirationResponse(expiresAt=normalized)
 
-    def patch_sandbox_metadata(
-        self, sandbox_id: str, patch: dict
-    ) -> Sandbox:
-        """Patch sandbox metadata (RFC 7396): non-null adds/replaces, null deletes."""
-        namespace = self._resolve_namespace_for_lookup(sandbox_id)
-        for key in patch:
-            if key in RESERVED_METADATA_KEYS or key.startswith("opensandbox.io/"):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "code": SandboxErrorCodes.INVALID_METADATA_LABEL,
-                        "message": f"Metadata key '{key}' is reserved on fleets.",
-                    },
-                )
-        upsert = {k: str(v) for k, v in patch.items() if v is not None}
-        delete_keys = [k for k, v in patch.items() if v is None]
-        try:
-            info = self._fastpath.update_metadata(
-                namespace, sandbox_id, upsert=upsert or None, delete_keys=delete_keys or None
-            )
-        except FastPathError as exc:
-            raise self._fastpath_http_error(exc) from exc
-        return map_sandbox(info)
+    def patch_sandbox_metadata(self, sandbox_id: str, patch: dict) -> Sandbox:
+        raise self._unsupported(
+            "metadata patch until FastPath exposes the fields required by the Sandbox response"
+        )
 
     # -- diagnostics -------------------------------------------------------
 
-    def get_sandbox_log_diagnostics(
-        self, sandbox_id: str, scope: str
-    ) -> DiagnosticResult:
+    def get_sandbox_log_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
         raise self._unsupported("sandbox logs")
 
-    def get_sandbox_event_diagnostics(
-        self, sandbox_id: str, scope: str
-    ) -> DiagnosticResult:
+    def get_sandbox_event_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
         return self._lifecycle_diagnostics(sandbox_id, "events", scope)
 
     def get_sandbox_logs(
@@ -422,8 +363,10 @@ class FleetSandboxService(SandboxService, ExtensionService):
         content = json.dumps(
             {
                 "sandbox_id": sandbox_id,
-                "runtime_state": response.sandbox.runtime_state,
-                "data_plane_state": response.sandbox.data_plane_state,
+                "runtime_state": _enum_name(pb2.RuntimeState, response.sandbox.runtime.state),
+                "data_plane_state": _enum_name(
+                    pb2.DataPlaneState, response.sandbox.data_plane.state
+                ),
                 "assignment_state": response.assignment_state,
                 "events": lines,
             },
@@ -444,6 +387,7 @@ class FleetSandboxService(SandboxService, ExtensionService):
         port: int,
         resolve_internal: bool = False,
         expires: Optional[int] = None,
+        use_proxy_host: bool = False,
     ) -> Endpoint:
         # The stable tenant-scoped gateway route (T6, OSEP-0007 Phase 1a)
         # is not implemented yet; endpoint discovery is a separate work item.
@@ -452,21 +396,7 @@ class FleetSandboxService(SandboxService, ExtensionService):
     # -- ExtensionService --------------------------------------------------
 
     def get_access_renew_extend_seconds(self, sandbox_id: str) -> Optional[int]:
-        """Read the renew-on-access value persisted under the reserved key."""
-        try:
-            info = self._fastpath.get_sandbox(
-                self._resolve_namespace_for_lookup(sandbox_id), sandbox_id
-            )
-        except FastPathError:
-            return None
-        raw = info.metadata.get(RENEW_EXTEND_SECONDS_METADATA_KEY)
-        if raw is None:
-            return None
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
+        return None
 
     # -- helpers -----------------------------------------------------------
 
@@ -522,10 +452,12 @@ class FleetSandboxService(SandboxService, ExtensionService):
         )
 
 
-def _to_datetime(unix_seconds: int) -> Optional[datetime]:
-    if unix_seconds <= 0:
-        return None
-    return datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
+def _enum_name(enum_type, value: int) -> str:
+    """Return a stable diagnostic value across FastPath enum version skew."""
+    try:
+        return enum_type.Name(value)
+    except ValueError:
+        return str(value)
 
 
 __all__ = ["FleetSandboxService"]

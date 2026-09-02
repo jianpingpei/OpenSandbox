@@ -15,497 +15,469 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for FleetSandboxService lifecycle behavior (OSEP-0007 Phase 1a)."""
+"""HTTP-to-gRPC integration tests for the fleets runtime."""
 
 from concurrent import futures
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import grpc
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
-from opensandbox_server.api.schema import (
-    CreateSandboxRequest,
-    ImageSpec,
-    ListSandboxesRequest,
-    PaginationRequest,
-    RenewSandboxExpirationRequest,
-    ResourceLimits,
-    SandboxFilter,
-)
-from opensandbox_server.config import AppConfig, FleetsRuntimeConfig
-from opensandbox_server.services.fleets.create_mapping import (
-    RENEW_EXTEND_SECONDS_METADATA_KEY,
+from opensandbox_server.api import lifecycle
+from opensandbox_server.api.schema import RenewSandboxExpirationRequest
+from opensandbox_server.config import (
+    AppConfig,
+    FleetsRuntimeConfig,
+    RuntimeConfig,
+    ServerConfig,
 )
 from opensandbox_server.services.fleets.fastpath_client import FastPathClient
 from opensandbox_server.services.fleets.fleet_service import FleetSandboxService
-from opensandbox_server.services.fleets.generated import (
-    fastpath_pb2 as pb2,
-)
-from opensandbox_server.services.fleets.generated import (
-    fastpath_pb2_grpc as pb2_grpc,
-)
-
-NOW = datetime(2026, 8, 18, 12, 0, 0, tzinfo=timezone.utc)
-NOW_TS = int(NOW.timestamp())
+from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
+from opensandbox_server.services.fleets.generated import fastpath_pb2_grpc as pb2_grpc
+from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
 
 
 class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
-    """Stateful in-process FastPath server."""
-
     def __init__(self):
-        self.sandboxes: dict[str, pb2.SandboxInfo] = {}
-        self.deleted: list[str] = []
-        self.last_get_namespace: str | None = None
-        self.fail_create_with: grpc.StatusCode | None = None
-        self.pool = pb2.PoolInfo(
-            namespace="ns-1",
-            name="default-pool",
-            runtime="container",
-            sandbox_cpu="500m",
-            sandbox_memory="512Mi",
-            sandbox_pids=256,
-        )
+        self.sandboxes: dict[tuple[str, str], tuple[str, int]] = {}
+        self.last_create: pb2.CreateSandboxRequest | None = None
+        self.last_get: pb2.GetSandboxRequest | None = None
+        self.last_update: pb2.UpdateSandboxRequest | None = None
+        self.last_delete: pb2.DeleteRequest | None = None
+        self.abort_update_with: grpc.StatusCode | None = None
+        self.abort_create_with: grpc.StatusCode | None = None
+        self.create_time_remaining: float | None = None
+        self.diagnostic_runtime_state = pb2.RUNTIME_STATE_READY
+        self.pool_has_resources = True
+        self.get_error_by_namespace: dict[str, grpc.StatusCode] = {}
 
-    def _info(self, sandbox_id: str, **overrides) -> pb2.SandboxInfo:
-        base = dict(
-            sandbox_uid=f"uid-{sandbox_id}",
-            sandbox_name=sandbox_id,
-            namespace="ns-1",
-            runtime_state="Ready",
-            data_plane_state="Ready",
-            image="python:3.11",
-            pool_ref="default-pool",
-            created_at_unix_seconds=NOW_TS,
-            expires_at_unix_seconds=NOW_TS + 3600,
+    @staticmethod
+    def _info(name: str, uid: str, namespace: str = "ns-1") -> pb2.SandboxInfo:
+        return pb2.SandboxInfo(
+            identity=pb2.SandboxIdentity(uid=uid, name=name, namespace=namespace),
+            applied_generation=1,
+            runtime=pb2.RuntimeInfo(state=pb2.RUNTIME_STATE_READY),
+            data_plane=pb2.DataPlaneInfo(state=pb2.DATA_PLANE_STATE_READY),
+            ready=True,
         )
-        base.update(overrides)
-        info = pb2.SandboxInfo(**base)
-        return info
-
-    def _get(self, sandbox_id: str):
-        info = self.sandboxes.get(sandbox_id)
-        if info is None:
-            raise KeyError(sandbox_id)
-        return info
 
     def CreateSandbox(self, request, context):
-        if self.fail_create_with is not None:
-            context.abort(self.fail_create_with, "scripted create failure")
-        info = self._info(request.request_id)
-        info.metadata.update(request.metadata)
-        info.image = request.image
-        info.pool_ref = request.pool_ref
-        info.expires_at_unix_seconds = request.expires_at_unix_seconds
-        self.sandboxes[request.request_id] = info
-        return info
+        self.last_create = request
+        self.create_time_remaining = context.time_remaining()
+        uid = f"uid-{request.request_id}"
+        self.sandboxes[(request.namespace, request.request_id)] = (uid, 1)
+        if self.abort_create_with is not None:
+            context.abort(self.abort_create_with, "scripted post-persistence failure")
+        return pb2.CreateSandboxResponse(
+            sandbox=self._info(request.request_id, uid, request.namespace),
+            generation=1,
+            completion=request.completion,
+        )
 
     def GetSandbox(self, request, context):
-        self.last_get_namespace = request.namespace
-        try:
-            return self._get(request.sandbox_name)
-        except KeyError:
+        self.last_get = request
+        namespace = request.sandbox.namespaced_name.namespace
+        name = request.sandbox.namespaced_name.name
+        if error := self.get_error_by_namespace.get(namespace):
+            context.abort(error, "scripted get failure")
+        current = self.sandboxes.get((namespace, name))
+        if current is None:
             context.abort(grpc.StatusCode.NOT_FOUND, "not found")
-            raise
-
-    def DeleteSandbox(self, request, context):
-        try:
-            self._get(request.sandbox_name)
-        except KeyError:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
-        self.deleted.append(request.sandbox_name)
-        return pb2.DeleteResponse(success=True)
-
-    def ListSandboxes(self, request, context):
-        response = pb2.ListResponse()
-        for info in self.sandboxes.values():
-            if request.metadata:
-                if not all(info.metadata.get(k) == v for k, v in request.metadata.items()):
-                    continue
-            copy = pb2.SandboxInfo()
-            copy.CopyFrom(info)
-            response.items.append(copy)
-        return response
+        uid, generation = current
+        if request.sandbox.expected_uid and request.sandbox.expected_uid != uid:
+            context.abort(grpc.StatusCode.ABORTED, "uid fence rejected")
+        if request.expected_generation and request.expected_generation != generation:
+            context.abort(grpc.StatusCode.ABORTED, "generation fence rejected")
+        return pb2.GetSandboxResponse(
+            sandbox=self._info(name, uid, namespace), generation=generation
+        )
 
     def UpdateSandbox(self, request, context):
-        try:
-            info = self._get(request.sandbox_name)
-        except KeyError:
+        self.last_update = request
+        if self.abort_update_with is not None:
+            context.abort(self.abort_update_with, "scripted update failure")
+        namespace = request.sandbox.namespaced_name.namespace
+        name = request.sandbox.namespaced_name.name
+        current = self.sandboxes.get((namespace, name))
+        if current is None:
             context.abort(grpc.StatusCode.NOT_FOUND, "not found")
-            return pb2.UpdateResponse(success=False)
-        if request.expires_at_unix_seconds > 0:
-            info.expires_at_unix_seconds = request.expires_at_unix_seconds
-        if request.metadata_upsert:
-            info.metadata.update(request.metadata_upsert)
-        for key in request.metadata_delete_keys:
-            info.metadata.pop(key, None)
-        return pb2.UpdateResponse(success=True, sandbox=info)
+        uid, generation = current
+        if request.sandbox.expected_uid != uid or (
+            request.expected_generation and request.expected_generation != generation
+        ):
+            context.abort(grpc.StatusCode.ABORTED, "fence rejected")
+        self.sandboxes[(namespace, name)] = (uid, generation + 1)
+        return pb2.UpdateSandboxResponse(
+            sandbox=pb2.SandboxIdentity(uid=uid, name=name, namespace=namespace),
+            committed_generation=generation + 1,
+        )
+
+    def DeleteSandbox(self, request, context):
+        self.last_delete = request
+        namespace = request.sandbox.namespaced_name.namespace
+        name = request.sandbox.namespaced_name.name
+        current = self.sandboxes.get((namespace, name))
+        if current is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
+        uid, _ = current
+        if request.sandbox.expected_uid != uid:
+            context.abort(grpc.StatusCode.ABORTED, "uid fence rejected")
+        self.sandboxes.pop((namespace, name))
+        return pb2.DeleteResponse()
 
     def GetSandboxDiagnostics(self, request, context):
-        try:
-            info = self._get(request.sandbox_name)
-        except KeyError:
+        sandbox = self.sandboxes.get((request.namespace, request.sandbox_name))
+        if sandbox is None:
             context.abort(grpc.StatusCode.NOT_FOUND, "not found")
-            return pb2.SandboxDiagnosticsResponse()
-        event = pb2.SandboxDiagnosticEvent(
-            timestamp_unix_nano=1,
-            level="INFO",
-            source="fastpath",
-            phase="create",
-            message="created",
-        )
+        uid, _ = sandbox
+        info = self._info(request.sandbox_name, uid, request.namespace)
+        info.runtime.state = self.diagnostic_runtime_state
         return pb2.SandboxDiagnosticsResponse(
-            sandbox=info, assignment_state="assigned", events=[event]
+            sandbox=info,
+            assignment_state="assigned",
+            events=[
+                pb2.SandboxDiagnosticEvent(
+                    timestamp_unix_nano=1,
+                    level="Info",
+                    source="fastlet",
+                    phase="Ready",
+                    message="sandbox ready",
+                )
+            ],
         )
-
-    def WaitSandboxReady(self, request, context):
-        try:
-            name = request.sandbox.namespaced_name.name
-            return self._get(name)
-        except KeyError:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
 
     def GetPool(self, request, context):
-        return self.pool
-
-
-def _make_config() -> AppConfig:
-    from opensandbox_server.config import RuntimeConfig, ServerConfig
-
-    return AppConfig(
-        server=ServerConfig(host="0.0.0.0", port=8080, api_key="x"),
-        runtime=RuntimeConfig(type="fleets", execd_image="ghcr.io/opensandbox/execd:latest"),
-        fleets=FleetsRuntimeConfig(namespace="ns-1"),
-    )
+        if not self.pool_has_resources:
+            return pb2.PoolInfo(namespace=request.namespace, name=request.pool_name)
+        return pb2.PoolInfo(
+            namespace=request.namespace,
+            name=request.pool_name,
+            sandbox_cpu="500m",
+            sandbox_memory="512Mi",
+        )
 
 
 @pytest.fixture
-def service():
+def http_fleets(monkeypatch):
     fake = _FakeFastPathService()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    pb2_grpc.add_FastPathServiceServicer_to_server(fake, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    channel = grpc.insecure_channel(f"127.0.0.1:{port}")
-    client = FastPathClient(endpoint=f"127.0.0.1:{port}")
-    client._channel = channel  # noqa: SLF001
-    client._stub = pb2_grpc.FastPathServiceStub(channel)
+    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+    pb2_grpc.add_FastPathServiceServicer_to_server(fake, grpc_server)
+    port = grpc_server.add_insecure_port("127.0.0.1:0")
+    grpc_server.start()
 
-    config = _make_config()
-    svc = FleetSandboxService(config, fastpath_client=client)
+    config = AppConfig(
+        server=ServerConfig(
+            host="0.0.0.0",
+            port=8080,
+            api_key="x",
+            max_sandbox_timeout_seconds=7200,
+        ),
+        runtime=RuntimeConfig(type="fleets", execd_image="ghcr.io/opensandbox/execd:latest"),
+        fleets=FleetsRuntimeConfig(namespace="ns-1"),
+    )
+    fastpath = FastPathClient(endpoint=f"127.0.0.1:{port}")
+    service = FleetSandboxService(config, fastpath_client=fastpath)
+    monkeypatch.setattr(lifecycle, "sandbox_service", service)
+
+    app = FastAPI()
+    app.include_router(lifecycle.router, prefix="/v1")
     try:
-        yield svc, fake
+        with TestClient(app) as client:
+            yield client, fake, service
     finally:
-        channel.close()
-        server.stop(None)
+        fastpath.close()
+        grpc_server.stop(None)
 
 
-def _create_request(**overrides):
-    payload = {
-        "image": ImageSpec(uri="python:3.11"),
-        "entrypoint": ["python", "-m", "http.server"],
+def test_http_create_calls_fastpath_with_ready_completion(http_fleets):
+    client, fake, service = http_fleets
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python", "-m", "http.server"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "metadata": {"team": "agents"},
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["id"].startswith("flt-")
+    assert body["status"]["state"] == "Running"
+    assert body["metadata"] == {"team": "agents"}
+    assert fake.last_create.request_id == body["id"]
+    assert fake.last_create.completion == pb2.CREATE_COMPLETION_READY
+    assert fake.create_time_remaining > service._fleets.wait_ready_timeout_millis / 1000
+
+
+def test_http_create_recovers_an_ambiguous_post_persistence_failure(http_fleets):
+    client, fake, _ = http_fleets
+    fake.abort_create_with = grpc.StatusCode.INTERNAL
+
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+
+    assert response.status_code == 202
+    sandbox_id = response.json()["id"]
+    assert sandbox_id.startswith("flt-")
+    assert fake.last_get is not None
+    assert ("ns-1", sandbox_id) in fake.sandboxes
+
+
+def test_http_create_rejects_timeout_pool_mismatch_and_unreadable_extension(http_fleets):
+    client, fake, _ = http_fleets
+    base = {
+        "image": {"uri": "python:3.11"},
+        "entrypoint": ["python"],
         "timeout": 3600,
-        "resource_limits": ResourceLimits(root={"cpu": "500m", "memory": "512Mi"}),
+        "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
     }
-    payload.update(overrides)
-    return CreateSandboxRequest(**payload)
 
-
-# -- create ---------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_create_sandbox_returns_running(service):
-    svc, fake = service
-    response = await svc.create_sandbox(_create_request())
-    assert response.status.state == "Running"
-    assert response.id in fake.sandboxes
-    assert response.expires_at is not None
-    assert response.created_at == NOW
-
-
-@pytest.mark.asyncio
-async def test_create_sandbox_hides_reserved_metadata(service):
-    svc, fake = service
-    response = await svc.create_sandbox(
-        _create_request(extensions={"access.renew.extend.seconds": "300"})
+    too_long = client.post("/v1/sandboxes", json={**base, "timeout": 10**9})
+    pool_mismatch = client.post(
+        "/v1/sandboxes",
+        json={**base, "resourceLimits": {"cpu": "1", "memory": "512Mi"}},
     )
-    assert response.metadata is None or RENEW_EXTEND_SECONDS_METADATA_KEY not in response.metadata
-    # The value is still persisted for ExtensionService.
-    assert fake.sandboxes[response.id].metadata[RENEW_EXTEND_SECONDS_METADATA_KEY] == "300"
+    renew_extension = client.post(
+        "/v1/sandboxes",
+        json={**base, "extensions": {"access.renew.extend.seconds": "300"}},
+    )
+    fake.pool_has_resources = False
+    empty_pool_profile = client.post("/v1/sandboxes", json=base)
+
+    assert too_long.status_code == 400
+    assert pool_mismatch.status_code == 400
+    assert "resourceLimits" in pool_mismatch.json()["detail"]["message"]
+    assert renew_extension.status_code == 400
+    assert "access.renew.extend.seconds" in renew_extension.json()["detail"]["message"]
+    assert empty_pool_profile.status_code == 400
+    assert (
+        "not defined by the selected SandboxPool" in empty_pool_profile.json()["detail"]["message"]
+    )
 
 
-@pytest.mark.asyncio
-async def test_create_sandbox_enforces_max_timeout(service):
-    svc, fake = service
-    svc._app_config.server.max_sandbox_timeout_seconds = 600
+def test_http_read_and_metadata_patch_report_new_fastpath_contract_gap(http_fleets):
+    client, _, _ = http_fleets
+    created = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python", "-m", "http.server"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "metadata": {"team": "agents", "remove-me": "yes"},
+        },
+    ).json()
+    sandbox_id = created["id"]
+
+    responses = [
+        client.get(f"/v1/sandboxes/{sandbox_id}"),
+        client.patch(
+            f"/v1/sandboxes/{sandbox_id}/metadata",
+            json={"team": "platform", "remove-me": None},
+        ),
+        client.get("/v1/sandboxes", params={"pageSize": 10}),
+    ]
+
+    assert [response.status_code for response in responses] == [400, 400, 400]
+    assert all(
+        response.json()["detail"]["code"] == "FLEETS::API_NOT_SUPPORTED" for response in responses
+    )
+
+
+def test_http_renew_and_delete_use_uid_fences(http_fleets):
+    client, fake, _ = http_fleets
+    created = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    ).json()
+    sandbox_id = created["id"]
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+
+    renewed = client.post(
+        f"/v1/sandboxes/{sandbox_id}/renew-expiration",
+        json={"expiresAt": expires_at.isoformat()},
+    )
+    past = client.post(
+        f"/v1/sandboxes/{sandbox_id}/renew-expiration",
+        json={"expiresAt": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()},
+    )
+    deleted = client.delete(f"/v1/sandboxes/{sandbox_id}")
+
+    assert renewed.status_code == 200
+    assert fake.last_update.sandbox.expected_uid == f"uid-{sandbox_id}"
+    assert fake.last_update.expected_generation == 0
+    assert past.status_code == 400
+    assert deleted.status_code == 204
+    assert fake.last_delete.sandbox.expected_uid == f"uid-{sandbox_id}"
+
+
+def test_http_renew_maps_fence_conflict_and_missing_sandbox(http_fleets):
+    client, fake, _ = http_fleets
+    created = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    ).json()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    fake.abort_update_with = grpc.StatusCode.ABORTED
+
+    conflict = client.post(
+        f"/v1/sandboxes/{created['id']}/renew-expiration",
+        json={"expiresAt": expires_at.isoformat()},
+    )
+    missing_renew = client.post(
+        "/v1/sandboxes/flt-missing/renew-expiration",
+        json={"expiresAt": expires_at.isoformat()},
+    )
+    missing_delete = client.delete("/v1/sandboxes/flt-missing")
+
+    assert conflict.status_code == 409
+    assert missing_renew.status_code == 404
+    assert missing_delete.status_code == 404
+
+
+def test_diagnostics_use_new_structured_state(http_fleets):
+    client, fake, service = http_fleets
+    sandbox_id = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    ).json()["id"]
+    content = service.get_sandbox_events(sandbox_id)
+
+    assert '"runtime_state": "RUNTIME_STATE_READY"' in content
+    assert '"data_plane_state": "DATA_PLANE_STATE_READY"' in content
+    assert "sandbox ready" in content
+
+    fake.diagnostic_runtime_state = 99
+    assert '"runtime_state": "99"' in service.get_sandbox_events(sandbox_id)
+
+
+@pytest.mark.parametrize("operation", ["logs", "pause", "resume", "endpoint"])
+def test_unsupported_fleets_operations_are_explicit(http_fleets, operation):
+    _, _, service = http_fleets
+
     with pytest.raises(HTTPException) as exc_info:
-        await svc.create_sandbox(_create_request(timeout=3600))
+        if operation == "logs":
+            service.get_sandbox_logs("flt-1")
+        elif operation == "pause":
+            service.pause_sandbox("flt-1")
+        elif operation == "resume":
+            service.resume_sandbox("flt-1")
+        else:
+            service.get_endpoint("flt-1", 44772)
+
     assert exc_info.value.status_code == 400
 
 
-def test_lazy_connect_opened_on_first_call():
-    """The client connects on first use; no explicit connect() is required."""
-    fake = _FakeFastPathService()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-    pb2_grpc.add_FastPathServiceServicer_to_server(fake, server)
-    port = server.add_insecure_port("127.0.0.1:0")
-    server.start()
-    try:
-        config = _make_config()
-        client = FastPathClient(endpoint=f"127.0.0.1:{port}")
-        svc = FleetSandboxService(config, fastpath_client=client)
-        fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-        sandbox = svc.get_sandbox("sbx-1")
-        assert sandbox.id == "sbx-1"
-        assert client._stub is not None
-    finally:
-        server.stop(None)
+def test_fleets_snapshot_runtime_is_noop(http_fleets):
+    _, _, service = http_fleets
 
+    runtime = create_snapshot_runtime(config=service._app_config)
 
-@pytest.mark.asyncio
-async def test_create_sandbox_rejects_unsupported_fields(service):
-    svc, _ = service
-    with pytest.raises(HTTPException) as exc_info:
-        await svc.create_sandbox(_create_request(snapshot_id="snap-1", image=None))
-    assert exc_info.value.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_create_sandbox_pool_mismatch_rejected(service):
-    svc, _ = service
-    request = _create_request(
-        resource_limits=ResourceLimits(root={"cpu": "1", "memory": "512Mi"})
-    )
-    with pytest.raises(HTTPException) as exc_info:
-        await svc.create_sandbox(request)
-    assert exc_info.value.status_code == 400
-    assert "resourceLimits" in exc_info.value.detail["message"]
-
-
-@pytest.mark.asyncio
-async def test_create_sandbox_ambiguous_failure_returns_pending(service):
-    svc, fake = service
-    # Simulate a create that failed after durable intent was persisted.
-    fake.fail_create_with = grpc.StatusCode.INTERNAL
-    request = _create_request()
-    preexisting = fake._info("pre-created", runtime_state="Creating", data_plane_state="")
-    fake.sandboxes["pre-created"] = preexisting
-    # The service generates its own id; seed intent under that id by creating
-    # first without the failure, then flip the failure flag and repeat.
-    fake.fail_create_with = None
-    response = await svc.create_sandbox(request)
-    created_id = response.id
-    fake.fail_create_with = grpc.StatusCode.INTERNAL
-    # A second create with a fresh id fails hard when no intent exists.
-    with pytest.raises(HTTPException):
-        await svc.create_sandbox(_create_request(env={"X": "2"}))
-    assert created_id in fake.sandboxes
-
-
-# -- get / list -----------------------------------------------------------
-
-
-def test_get_sandbox_returns_mapped_model(service):
-    svc, fake = service
-    info = fake._info("sbx-1", metadata={"team": "agents", RENEW_EXTEND_SECONDS_METADATA_KEY: "300"})
-    fake.sandboxes["sbx-1"] = info
-    sandbox = svc.get_sandbox("sbx-1")
-    assert sandbox.id == "sbx-1"
-    assert sandbox.status.state == "Running"
-    assert sandbox.metadata == {"team": "agents"}
-    assert sandbox.image is not None
-    assert sandbox.image.uri == "python:3.11"
-
-
-def test_get_sandbox_missing_maps_to_404(service):
-    svc, _ = service
-    with pytest.raises(HTTPException) as exc_info:
-        svc.get_sandbox("missing")
-    assert exc_info.value.status_code == 404
-
-
-def test_list_sandboxes_pagination_and_state_filter(service):
-    svc, fake = service
-    for i in range(5):
-        fake.sandboxes[f"sbx-{i}"] = fake._info(
-            f"sbx-{i}",
-            runtime_state="Creating" if i == 0 else "Ready",
-            data_plane_state="" if i == 0 else "Ready",
-        )
-    request = ListSandboxesRequest(
-        filter=SandboxFilter(state=["Running"]),
-        pagination=PaginationRequest(page=1, pageSize=2),
-    )
-    response = svc.list_sandboxes(request)
-    assert len(response.items) == 2
-    assert all(item.status.state == "Running" for item in response.items)
-    assert response.pagination.total_items == 4
-    assert response.pagination.total_pages == 2
-    assert response.pagination.has_next_page is True
-
-
-def test_list_sandboxes_metadata_filter(service):
-    svc, fake = service
-    fake.sandboxes["a"] = fake._info("a", metadata={"team": "agents"})
-    fake.sandboxes["b"] = fake._info("b", metadata={"team": "ops"})
-    response = svc.list_sandboxes(
-        ListSandboxesRequest(filter=SandboxFilter(metadata={"team": "agents"}))
-    )
-    assert [item.id for item in response.items] == ["a"]
-
-
-# -- delete / renew / metadata --------------------------------------------
-
-
-def test_delete_sandbox_preflight_404(service):
-    svc, _ = service
-    with pytest.raises(HTTPException) as exc_info:
-        svc.delete_sandbox("missing")
-    assert exc_info.value.status_code == 404
-
-
-def test_delete_sandbox_submits_async_delete(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-    svc.delete_sandbox("sbx-1")
-    assert "sbx-1" in fake.deleted
-
-
-def test_renew_expiration_updates_absolute_expiry(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-    new_expiry = datetime.now(timezone.utc) + timedelta(hours=2)
-    expected = new_expiry.replace(microsecond=0)
-    response = svc.renew_expiration(
-        "sbx-1", RenewSandboxExpirationRequest(expires_at=new_expiry)
-    )
-    assert response.expires_at == expected
-    assert fake.sandboxes["sbx-1"].expires_at_unix_seconds == int(expected.timestamp())
-
-
-def test_renew_expiration_rejects_past(service):
-    svc, _ = service
-    with pytest.raises(HTTPException) as exc_info:
-        svc.renew_expiration(
-            "sbx-1", RenewSandboxExpirationRequest(expires_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
-        )
-    assert exc_info.value.status_code == 400
-
-
-def test_patch_metadata_upsert_and_delete(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1", metadata={"a": "1"})
-    sandbox = svc.patch_sandbox_metadata("sbx-1", {"b": "2", "a": None})
-    assert sandbox.metadata == {"b": "2"}
-    assert fake.sandboxes["sbx-1"].metadata["b"] == "2"
-    assert "a" not in fake.sandboxes["sbx-1"].metadata
-
-
-def test_patch_metadata_rejects_reserved_keys(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-    for key in (RENEW_EXTEND_SECONDS_METADATA_KEY, "opensandbox.io/whatever"):
-        with pytest.raises(HTTPException) as exc_info:
-            svc.patch_sandbox_metadata("sbx-1", {key: "x"})
-        assert exc_info.value.status_code == 400
-
-
-# -- diagnostics / unsupported --------------------------------------------
-
-
-def test_diagnostics_backed_by_lifecycle_events(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-    result = svc.get_sandbox_event_diagnostics("sbx-1", "events")
-    assert result.kind == "events"
-    assert "created" in result.content
-
-
-def test_logs_unsupported(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info("sbx-1")
-    with pytest.raises(HTTPException) as exc_info:
-        svc.get_sandbox_logs("sbx-1")
-    assert exc_info.value.status_code == 400
-    assert "not supported" in exc_info.value.detail["message"]
-
-
-def test_pause_resume_unsupported(service):
-    svc, _ = service
-    with pytest.raises(HTTPException):
-        svc.pause_sandbox("sbx-1")
-    with pytest.raises(HTTPException):
-        svc.resume_sandbox("sbx-1")
-
-
-def test_get_endpoint_unsupported_in_phase_1a(service):
-    svc, _ = service
-    with pytest.raises(HTTPException) as exc_info:
-        svc.get_endpoint("sbx-1", 44772)
-    assert exc_info.value.status_code == 400
-
-
-# -- ExtensionService -----------------------------------------------------
-
-
-def test_access_renew_extend_seconds_reads_reserved_key(service):
-    svc, fake = service
-    fake.sandboxes["sbx-1"] = fake._info(
-        "sbx-1", metadata={RENEW_EXTEND_SECONDS_METADATA_KEY: "300"}
-    )
-    assert svc.get_access_renew_extend_seconds("sbx-1") == 300
-
-
-def test_access_renew_extend_seconds_missing_or_invalid(service):
-    svc, fake = service
-    fake.sandboxes["plain"] = fake._info("plain")
-    fake.sandboxes["bad"] = fake._info("bad", metadata={RENEW_EXTEND_SECONDS_METADATA_KEY: "oops"})
-    assert svc.get_access_renew_extend_seconds("plain") is None
-    assert svc.get_access_renew_extend_seconds("bad") is None
-    assert svc.get_access_renew_extend_seconds("missing") is None
-
-
-def test_background_lookup_falls_back_across_tenant_namespaces(service):
-    """Renew workers have no tenant context; the provider's namespaces are
-    scanned so equal sandbox IDs in tenant namespaces keep receiving renewals."""
-
-    class _FakeTenantProvider:
-        def __init__(self, entries):
-            self._entries = entries
-
-        def list_tenants(self):
-            return self._entries
-
-    from opensandbox_server.tenants.models import TenantEntry
-
-    svc, fake = service
-    # Sandbox lives in the tenant namespace, not in the global one.
-    tenant_ns = TenantEntry(name="tenant-1", namespace="ns-tenant")
-    fake.sandboxes["sbx-1"] = fake._info(
-        "sbx-1", metadata={RENEW_EXTEND_SECONDS_METADATA_KEY: "300"}
-    )
-    fake.pool.namespace = "ns-tenant"
-    svc._tenant_provider = _FakeTenantProvider([tenant_ns])  # noqa: SLF001
-
-    assert svc.get_access_renew_extend_seconds("sbx-1") == 300
-    assert fake.last_get_namespace == "ns-tenant"
-
-
-# -- startup wiring -------------------------------------------------------
-
-
-def test_snapshot_runtime_factory_returns_noop_for_fleets():
-    from opensandbox_server.services.snapshot_runtime_factory import (
-        create_snapshot_runtime,
-    )
-
-    from opensandbox_server.config import RuntimeConfig, ServerConfig
-
-    runtime = create_snapshot_runtime(
-        AppConfig(
-            server=ServerConfig(host="0.0.0.0", port=8080, api_key="x"),
-            runtime=RuntimeConfig(type="fleets", execd_image="ghcr.io/opensandbox/execd:latest"),
-        )
-    )
     assert runtime.supports_create_snapshot() is False
+
+
+def test_background_renew_resolves_tenant_namespace(http_fleets):
+    client, fake, service = http_fleets
+    sandbox_id = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    ).json()["id"]
+    sandbox = fake.sandboxes.pop(("ns-1", sandbox_id))
+    fake.sandboxes[("tenant-a", sandbox_id)] = sandbox
+    service.set_tenant_provider(
+        SimpleNamespace(list_tenants=lambda: [SimpleNamespace(namespace="tenant-a")])
+    )
+
+    service.renew_expiration(
+        sandbox_id,
+        request=RenewSandboxExpirationRequest(
+            expiresAt=datetime.now(timezone.utc) + timedelta(hours=2)
+        ),
+    )
+
+    assert fake.last_get.sandbox.namespaced_name.namespace == "tenant-a"
+    assert fake.last_update.sandbox.namespaced_name.namespace == "tenant-a"
+
+
+def test_background_lookup_does_not_treat_fastpath_failure_as_namespace_miss(http_fleets):
+    _, fake, service = http_fleets
+    fake.get_error_by_namespace["ns-1"] = grpc.StatusCode.UNAVAILABLE
+    service.set_tenant_provider(
+        SimpleNamespace(list_tenants=lambda: [SimpleNamespace(namespace="tenant-a")])
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.renew_expiration(
+            "flt-1",
+            request=RenewSandboxExpirationRequest(
+                expiresAt=datetime.now(timezone.utc) + timedelta(hours=2)
+            ),
+        )
+
+    assert exc_info.value.status_code == 503
+
+
+def test_http_create_returns_503_when_fastpath_is_unavailable(monkeypatch):
+    config = AppConfig(
+        server=ServerConfig(host="0.0.0.0", port=8080, api_key="x"),
+        runtime=RuntimeConfig(type="fleets", execd_image="ghcr.io/opensandbox/execd:latest"),
+        fleets=FleetsRuntimeConfig(
+            namespace="ns-1",
+            fastpath_endpoint="127.0.0.1:1",
+            fastpath_timeout_seconds=1,
+        ),
+    )
+    fastpath = FastPathClient(endpoint="127.0.0.1:1", timeout_seconds=1)
+    service = FleetSandboxService(config, fastpath_client=fastpath)
+    monkeypatch.setattr(lifecycle, "sandbox_service", service)
+    app = FastAPI()
+    app.include_router(lifecycle.router, prefix="/v1")
+
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/sandboxes",
+                json={
+                    "image": {"uri": "python:3.11"},
+                    "entrypoint": ["python"],
+                    "timeout": 3600,
+                    "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+                },
+            )
+            assert response.status_code == 503
+    finally:
+        fastpath.close()
