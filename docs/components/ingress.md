@@ -161,8 +161,7 @@ Endpoint handles can be issued while a sandbox is pending; actual
 traffic receives `503` with `Retry-After` until FastPath publishes the route.
 Port `18080` handles are reserved for SDK compatibility and traffic returns
 `501`; use the authenticated Server `GET/PUT /sandboxes/{id}/networkpolicy`
-route instead. See [Server policy operations](/components/server#fleets-workload-and-network-policy)
-and the [real HTTP E2E suite](/guides/fleets-http-e2e).
+route instead. See [Server policy operations](/components/server#fleets-workload-and-network-policy).
 
 | Flag | Default | Description |
 |------|---------|-------------|
