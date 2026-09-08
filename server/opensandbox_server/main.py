@@ -129,9 +129,8 @@ async def lifespan(app: FastAPI):
 
         if app_config.runtime.type == "kubernetes":
             # OSEP-0014: the Kubernetes backend validates every enumerable
-            # tenant namespace before serving traffic. Fleets is a separate
-            # gRPC control plane and must not require direct cluster access;
-            # FastPath validates its namespaced resources on each request.
+            # tenant namespace before serving traffic. Fleets CR readers are
+            # lazy and must not block a legacy-only deployment at startup.
             try:
                 from opensandbox_server.services.k8s.client import K8sClient
 
@@ -143,7 +142,7 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning(
                 "Skipping direct tenant namespace startup validation for the fleets runtime; "
-                "FastPath validates namespaced resources on each request."
+                "Cluster credentials and CR permissions are checked on first read."
             )
 
     from anyio.to_thread import current_default_thread_limiter
@@ -201,6 +200,7 @@ async def lifespan(app: FastAPI):
     if consumer is not None:
         await consumer.stop()
     shutdown_otel_metrics()
+    sandbox_service.close()
     snapshot_service.close()
     close_snapshot_repository()
     if tenant_provider is not None:

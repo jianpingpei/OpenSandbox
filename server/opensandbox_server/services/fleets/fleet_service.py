@@ -17,8 +17,8 @@
 
 """FleetSandboxService: fast-sandbox (fleets) runtime backend (OSEP-0007).
 
-FastPath owns live runtime state. Create echoes request-owned public fields;
-reads that require fields absent from FastPath return FLEETS::API_NOT_SUPPORTED.
+FastPath owns mutations and live runtime operations. Kubernetes LIST/WATCH
+provides the persisted Sandbox fields and eventually convergent observations.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from opensandbox_server.api.schema import (
     Sandbox,
     SandboxStatus,
 )
-from opensandbox_server.config import AppConfig, FleetsRuntimeConfig
+from opensandbox_server.config import AppConfig, FleetsRuntimeConfig, KubernetesRuntimeConfig
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.diagnostics import (
     DiagnosticResult,
@@ -64,9 +64,13 @@ from opensandbox_server.services.fleets.fastpath_client import (
     FastPathUnavailable,
 )
 from opensandbox_server.services.fleets.endpoint import build_endpoint
+from opensandbox_server.services.fleets.cr_reader import SandboxCRReader
+from opensandbox_server.services.fleets.cr_mapping import sandbox_from_cr
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 from opensandbox_server.services.fleets.status_mapping import map_reason, map_state
 from opensandbox_server.services.sandbox_service import SandboxService
+from opensandbox_server.services.k8s.client import K8sClient
+from opensandbox_server.services.k8s.list_helpers import _build_list_sandboxes_response
 from opensandbox_server.services.validators import (
     ensure_future_expiration,
     ensure_timeout_within_limit,
@@ -82,15 +86,31 @@ class FleetSandboxService(SandboxService, ExtensionService):
         self,
         config: AppConfig,
         fastpath_client: Optional[FastPathClient] = None,
+        k8s_client: Optional[K8sClient] = None,
     ):
         self._app_config = config
         fleets_config = config.fleets or FleetsRuntimeConfig()
+        if (
+            "namespace" not in fleets_config.model_fields_set
+            and config.kubernetes
+            and config.kubernetes.namespace
+        ):
+            fleets_config = fleets_config.model_copy(
+                update={"namespace": config.kubernetes.namespace}
+            )
         self._fleets = fleets_config
         self._fastpath = fastpath_client or FastPathClient(
             endpoint=fleets_config.fastpath_endpoint,
             timeout_seconds=fleets_config.fastpath_timeout_seconds,
         )
         self._tenant_provider = None  # type: ignore[assignment]
+        self._cr_reader = SandboxCRReader(
+            config.kubernetes or KubernetesRuntimeConfig(), k8s_client
+        )
+
+    def close(self) -> None:
+        self._cr_reader.close()
+        self._fastpath.close()
 
     @staticmethod
     def generate_sandbox_id() -> str:
@@ -237,6 +257,8 @@ class FleetSandboxService(SandboxService, ExtensionService):
             info = existing.sandbox
         else:
             info = response.sandbox
+        finally:
+            self._cr_reader.invalidate(namespace)
 
         return self._build_create_response(
             request,
@@ -274,14 +296,30 @@ class FleetSandboxService(SandboxService, ExtensionService):
         )
 
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
-        raise self._unsupported(
-            "get sandbox until FastPath exposes the fields required by the Sandbox response"
+        return sandbox_from_cr(self._get_cr(sandbox_id))
+
+    def _get_cr(self, sandbox_id: str) -> dict:
+        from opensandbox_server.tenants.context import get_current_tenant
+
+        namespace = self._resolve_namespace()
+        if get_current_tenant() is not None or self._tenant_provider is None:
+            return self._cr_reader.get(namespace, sandbox_id)
+        namespaces = dict.fromkeys(
+            [namespace] + [entry.namespace for entry in self._tenant_provider.list_tenants()]
         )
+        for candidate in namespaces:
+            try:
+                return self._cr_reader.get(candidate, sandbox_id)
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+        raise self._fastpath_http_error(FastPathNotFound("NOT_FOUND", "Sandbox not found."))
+
+    def list_sandbox_objects(self) -> list[Sandbox]:
+        return [sandbox_from_cr(cr) for cr in self._cr_reader.list(self._resolve_namespace())]
 
     def list_sandboxes(self, request: ListSandboxesRequest) -> ListSandboxesResponse:
-        raise self._unsupported(
-            "list sandboxes until FastPath exposes the fields required by Sandbox responses"
-        )
+        return _build_list_sandboxes_response(self.list_sandbox_objects(), request)
 
     def delete_sandbox(self, sandbox_id: str) -> None:
         """Preflight Get to preserve the public 404 contract, then submit an
@@ -299,6 +337,8 @@ class FleetSandboxService(SandboxService, ExtensionService):
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
+        finally:
+            self._cr_reader.invalidate(namespace)
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         raise self._unsupported("pause", status.HTTP_501_NOT_IMPLEMENTED)
@@ -325,6 +365,8 @@ class FleetSandboxService(SandboxService, ExtensionService):
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
+        finally:
+            self._cr_reader.invalidate(namespace)
         return RenewSandboxExpirationResponse(expiresAt=normalized)
 
     def patch_sandbox_metadata(
@@ -332,9 +374,26 @@ class FleetSandboxService(SandboxService, ExtensionService):
         sandbox_id: str,
         patch: PatchSandboxMetadataRequest,
     ) -> Sandbox:
-        raise self._unsupported(
-            "metadata patch until FastPath exposes the fields required by the Sandbox response"
-        )
+        current = self._get_cr(sandbox_id)
+        if not patch:
+            return sandbox_from_cr(current)
+        self._apply_metadata_patch({}, patch)
+        metadata = current["metadata"]
+        namespace = metadata["namespace"]
+        try:
+            self._fastpath.update_metadata(
+                namespace,
+                sandbox_id,
+                upsert={key: value for key, value in patch.items() if value is not None},
+                delete_keys=[key for key, value in patch.items() if value is None],
+                expected_uid=metadata["uid"],
+                expected_generation=metadata["generation"],
+            )
+        except FastPathError as exc:
+            raise self._fastpath_http_error(exc) from exc
+        finally:
+            self._cr_reader.invalidate(namespace)
+        return sandbox_from_cr(self._cr_reader.get(namespace, sandbox_id))
 
     # -- diagnostics -------------------------------------------------------
 

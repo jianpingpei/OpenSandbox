@@ -209,8 +209,31 @@ The Fleets Server adapter returns a stable route from
 `GET /sandboxes/{sandboxId}/endpoints/{port}` without calling FastPath or waiting
 for readiness. It signs the authenticated tenant namespace, sandbox ID, and port
 using the existing ingress signing configuration. Without multi-tenancy, it uses
-the configured Fleets namespace. This does not change backend selection or
-implement template-based creation and the incomplete Sandbox read APIs.
+the configured Fleets namespace.
+
+With `runtime.type = "kubernetes"`, the Server also serves existing `flt-` sandbox
+IDs through Fleets; no additional enable flag or runtime list is needed. Ordinary
+IDs and create requests retain their Kubernetes behavior. The existing `fleets`
+runtime remains available for Fleets-only deployments. This does not implement
+template management or a template-based create selector.
+
+Fleets Get/List reads the existing `sandbox.fast.io/v1alpha2` Sandbox CRs through
+the Kubernetes LIST/WATCH cache. Writes still go through FastPath and invalidate
+the corresponding cache. Unsynced or invalidated reads use the live Kubernetes
+API; Get does not interpret a cache miss as NotFound. Reads require access to the
+same cluster as FastPath and `get`, `list`, `watch` permissions on `sandboxes` in
+each tenant namespace. Kubernetes deployments reuse their configured cluster
+client and default namespace; an explicit `[fleets].namespace` overrides the
+default when tenancy is disabled. Fleets-only deployments load Kubernetes
+credentials lazily on the first CR read. No separate sandbox database is created.
+
+The shared sandbox list combines both backends for the current tenant, then
+filters, orders by creation time descending (ID breaks ties), and paginates once.
+Totals describe the whole filtered collection. An unregistered FastSandbox API
+contributes no items. Permission failures or backend read failures fail the list
+instead of returning a silently incomplete collection. These aggregation and CR
+read behaviors are implementation decisions supplementing OSEP-0007, not claims
+that the proposal already specifies cross-backend list aggregation.
 
 Configure the Server with a gateway and a key also present in the Ingress
 `--secure-access-keys` key ring:

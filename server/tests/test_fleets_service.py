@@ -18,14 +18,16 @@
 """HTTP-to-gRPC integration tests for the fleets runtime."""
 
 from concurrent import futures
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import grpc
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from kubernetes.client import ApiException, CustomObjectsApi, V1APIResource, V1APIResourceList
 
 from opensandbox_server.api import lifecycle
 from opensandbox_server.api.schema import RenewSandboxExpirationRequest
@@ -33,11 +35,18 @@ from opensandbox_server.config import (
     AppConfig,
     FleetsRuntimeConfig,
     IngressConfig,
+    KubernetesRuntimeConfig,
     RuntimeConfig,
     ServerConfig,
 )
 from opensandbox_server.services.fleets.fastpath_client import FastPathClient
+from opensandbox_server.services.composite_service import CompositeSandboxService
+from opensandbox_server.services.factory import create_sandbox_service
 from opensandbox_server.services.fleets.fleet_service import FleetSandboxService
+from opensandbox_server.services.k8s.client import K8sClient
+from opensandbox_server.services.k8s.informer import WorkloadInformer
+from opensandbox_server.services.k8s.kubernetes_service import KubernetesSandboxService
+from opensandbox_server.services.fleets.cr_mapping import METADATA_PREFIX
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 from opensandbox_server.services.fleets.generated import fastpath_pb2_grpc as pb2_grpc
 from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
@@ -48,6 +57,7 @@ from opensandbox_server.tenants.models import TenantEntry
 class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
     def __init__(self):
         self.sandboxes: dict[tuple[str, str], tuple[str, int]] = {}
+        self.crs: dict[tuple[str, str], dict] = {}
         self.last_create: pb2.CreateSandboxRequest | None = None
         self.last_get: pb2.GetSandboxRequest | None = None
         self.last_update: pb2.UpdateSandboxRequest | None = None
@@ -78,6 +88,37 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
         self.create_time_remaining = context.time_remaining()
         uid = f"uid-{request.request_id}"
         self.sandboxes[(request.namespace, request.request_id)] = (uid, 1)
+        self.crs[(request.namespace, request.request_id)] = {
+            "metadata": {
+                "name": request.request_id,
+                "namespace": request.namespace,
+                "uid": uid,
+                "generation": 1,
+                "resourceVersion": "1",
+                "creationTimestamp": datetime.now(timezone.utc).isoformat(),
+                "labels": {METADATA_PREFIX + key: value for key, value in request.metadata.items()},
+            },
+            "spec": {
+                "image": request.image,
+                "command": list(request.command),
+                "poolRef": request.pool_ref,
+                "expireTime": datetime.fromtimestamp(
+                    request.expires_at_unix_seconds, timezone.utc
+                ).isoformat(),
+            },
+            "status": {
+                "observedGeneration": 1,
+                "runtime": {"state": "Creating" if self.create_pending else "Ready"},
+                "dataPlane": {"state": "Pending" if self.create_pending else "Ready"},
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "False" if self.create_pending else "True",
+                        "observedGeneration": 1,
+                    }
+                ],
+            },
+        }
         if self.abort_create_with is not None:
             context.abort(self.abort_create_with, "scripted post-persistence failure")
         info = self._info(request.request_id, uid, request.namespace)
@@ -99,7 +140,7 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
             context.abort(error, "scripted get failure")
         current = self.sandboxes.get((namespace, name))
         if current is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
+            return context.abort(grpc.StatusCode.NOT_FOUND, "not found")
         uid, generation = current
         if request.sandbox.expected_uid and request.sandbox.expected_uid != uid:
             context.abort(grpc.StatusCode.ABORTED, "uid fence rejected")
@@ -117,13 +158,24 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
         name = request.sandbox.namespaced_name.name
         current = self.sandboxes.get((namespace, name))
         if current is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
+            return context.abort(grpc.StatusCode.NOT_FOUND, "not found")
         uid, generation = current
         if request.sandbox.expected_uid != uid or (
             request.expected_generation and request.expected_generation != generation
         ):
             context.abort(grpc.StatusCode.ABORTED, "fence rejected")
         self.sandboxes[(namespace, name)] = (uid, generation + 1)
+        cr = self.crs[(namespace, name)]
+        cr["metadata"]["generation"] = generation + 1
+        cr["metadata"]["resourceVersion"] = str(generation + 1)
+        if request.HasField("expires_at_unix_seconds"):
+            cr["spec"]["expireTime"] = datetime.fromtimestamp(
+                request.expires_at_unix_seconds, timezone.utc
+            ).isoformat()
+        for key, value in request.metadata_upsert.items():
+            cr["metadata"]["labels"][METADATA_PREFIX + key] = value
+        for key in request.metadata_delete_keys:
+            cr["metadata"]["labels"].pop(METADATA_PREFIX + key, None)
         return pb2.UpdateSandboxResponse(
             sandbox=pb2.SandboxIdentity(uid=uid, name=name, namespace=namespace),
             committed_generation=generation + 1,
@@ -135,17 +187,18 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
         name = request.sandbox.namespaced_name.name
         current = self.sandboxes.get((namespace, name))
         if current is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
+            return context.abort(grpc.StatusCode.NOT_FOUND, "not found")
         uid, _ = current
         if request.sandbox.expected_uid != uid:
             context.abort(grpc.StatusCode.ABORTED, "uid fence rejected")
         self.sandboxes.pop((namespace, name))
+        self.crs.pop((namespace, name), None)
         return pb2.DeleteResponse()
 
     def GetSandboxDiagnostics(self, request, context):
         sandbox = self.sandboxes.get((request.namespace, request.sandbox_name))
         if sandbox is None:
-            context.abort(grpc.StatusCode.NOT_FOUND, "not found")
+            return context.abort(grpc.StatusCode.NOT_FOUND, "not found")
         uid, _ = sandbox
         info = self._info(request.sandbox_name, uid, request.namespace)
         info.runtime.state = self.diagnostic_runtime_state
@@ -193,7 +246,42 @@ def http_fleets(monkeypatch):
         fleets=FleetsRuntimeConfig(namespace="ns-1"),
     )
     fastpath = FastPathClient(endpoint=f"127.0.0.1:{port}")
-    service = FleetSandboxService(config, fastpath_client=fastpath)
+    with patch.object(K8sClient, "_load_config"):
+        k8s = K8sClient(KubernetesRuntimeConfig(informer_enabled=False))
+    api = Mock(spec=CustomObjectsApi)
+    api.get_api_resources.return_value = V1APIResourceList(
+        group_version="sandbox.fast.io/v1alpha2",
+        resources=[
+            V1APIResource(
+                name="sandboxes",
+                singular_name="sandbox",
+                kind="Sandbox",
+                namespaced=True,
+                verbs=["get", "list", "watch"],
+            )
+        ],
+    )
+
+    def get_cr(**kwargs):
+        cr = fake.crs.get((kwargs["namespace"], kwargs["name"]))
+        if cr is None:
+            raise ApiException(status=404)
+        return deepcopy(cr)
+
+    def list_crs(**kwargs):
+        return {
+            "metadata": {"resourceVersion": "1"},
+            "items": [
+                deepcopy(cr)
+                for (namespace, _), cr in fake.crs.items()
+                if namespace == kwargs["namespace"]
+            ],
+        }
+
+    api.get_namespaced_custom_object.side_effect = get_cr
+    api.list_namespaced_custom_object.side_effect = list_crs
+    k8s._custom_objects_api = api
+    service = FleetSandboxService(config, fastpath_client=fastpath, k8s_client=k8s)
     monkeypatch.setattr(lifecycle, "sandbox_service", service)
 
     app = FastAPI()
@@ -202,7 +290,7 @@ def http_fleets(monkeypatch):
         with TestClient(app) as client:
             yield client, fake, service
     finally:
-        fastpath.close()
+        service.close()
         grpc_server.stop(None)
 
 
@@ -282,8 +370,8 @@ def test_http_create_rejects_timeout_pool_mismatch_and_unreadable_extension(http
     )
 
 
-def test_http_read_and_metadata_patch_report_new_fastpath_contract_gap(http_fleets):
-    client, _, _ = http_fleets
+def test_http_read_and_metadata_patch_use_cr_fields(http_fleets):
+    client, fake, _ = http_fleets
     created = client.post(
         "/v1/sandboxes",
         json={
@@ -305,10 +393,201 @@ def test_http_read_and_metadata_patch_report_new_fastpath_contract_gap(http_flee
         client.get("/v1/sandboxes", params={"pageSize": 10}),
     ]
 
-    assert [response.status_code for response in responses] == [400, 400, 400]
-    assert all(
-        response.json()["detail"]["code"] == "FLEETS::API_NOT_SUPPORTED" for response in responses
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    fetched, patched, listed = [response.json() for response in responses]
+    cr = fake.crs[("ns-1", sandbox_id)]
+    assert fetched["image"] == {"uri": "python:3.11"}
+    assert fetched["entrypoint"] == ["python", "-m", "http.server"]
+    assert datetime.fromisoformat(
+        fetched["createdAt"].replace("Z", "+00:00")
+    ) == datetime.fromisoformat(cr["metadata"]["creationTimestamp"])
+    assert fetched["metadata"] == {"team": "agents", "remove-me": "yes"}
+    assert patched["metadata"] == {"team": "platform"}
+    assert fake.last_update.sandbox.expected_uid == cr["metadata"]["uid"]
+    assert fake.last_update.expected_generation == 1
+    assert listed["items"][0]["metadata"] == patched["metadata"]
+    assert listed["pagination"]["totalItems"] == 1
+
+
+@pytest.fixture
+def persisted_fleet(http_fleets):
+    client, fake, service = http_fleets
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 3600,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+            "metadata": {"team": "agents"},
+        },
     )
+    assert response.status_code == 202
+    sandbox_id = response.json()["id"]
+    return client, fake, service, sandbox_id
+
+
+def test_cr_reads_do_not_depend_on_fastpath_and_remain_tenant_scoped(persisted_fleet):
+    client, fake, service, sandbox_id = persisted_fleet
+    fake.get_error_by_namespace["ns-1"] = grpc.StatusCode.UNAVAILABLE
+    other = deepcopy(fake.crs[("ns-1", sandbox_id)])
+    other["metadata"]["namespace"] = "tenant-a"
+    other["metadata"]["labels"][METADATA_PREFIX + "team"] = "other"
+    fake.crs[("tenant-a", sandbox_id)] = other
+    assert client.get(f"/v1/sandboxes/{sandbox_id}").status_code == 200
+    previous = get_current_tenant()
+    try:
+        set_current_tenant(TenantEntry(name="tenant-a", namespace="tenant-a"))
+        assert client.get(f"/v1/sandboxes/{sandbox_id}").json()["metadata"] == {"team": "other"}
+        listed = client.get("/v1/sandboxes").json()
+        assert listed["pagination"]["totalItems"] == 1
+        assert listed["items"][0]["metadata"] == {"team": "other"}
+        set_current_tenant(TenantEntry(name="empty", namespace="empty"))
+        assert client.get(f"/v1/sandboxes/{sandbox_id}").status_code == 404
+        assert client.get("/v1/sandboxes").json()["items"] == []
+    finally:
+        set_current_tenant(previous)
+
+
+def test_cr_watch_and_fastpath_mutations_refresh_http_reads(persisted_fleet, monkeypatch):
+    client, fake, service, sandbox_id = persisted_fleet
+    k8s = service._cr_reader._client
+    k8s.config.informer_enabled = True
+    monkeypatch.setattr(WorkloadInformer, "start", lambda self: None)
+    url = f"/v1/sandboxes/{sandbox_id}"
+    assert client.get(url).json()["status"]["state"] == "Running"
+    informer = k8s._lookup_informer("sandbox.fast.io", "v1alpha2", "sandboxes", "ns-1")
+    assert informer._full_resync()
+
+    cr = fake.crs[("ns-1", sandbox_id)]
+    cr["status"]["dataPlane"]["state"] = "Pending"
+    informer._handle_event({"type": "MODIFIED", "object": deepcopy(cr)})
+    assert client.get(url).json()["status"]["state"] == "Pending"
+
+    patched = client.patch(url + "/metadata", json={"team": "platform"})
+    assert patched.status_code == 200
+    assert patched.json()["metadata"] == {"team": "platform"}
+    assert client.get("/v1/sandboxes").json()["items"][0]["metadata"] == {"team": "platform"}
+
+    assert informer._full_resync()
+    expires = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(microsecond=0)
+    assert (
+        client.post(url + "/renew-expiration", json={"expiresAt": expires.isoformat()}).status_code
+        == 200
+    )
+    assert (
+        datetime.fromisoformat(client.get(url).json()["expiresAt"].replace("Z", "+00:00"))
+        == expires
+    )
+
+    cr["status"]["runtime"]["state"] = "Stopped"
+    assert informer._full_resync()
+    assert client.get(url).json()["status"]["state"] == "Terminated"
+    fake.crs.pop(("ns-1", sandbox_id))
+    informer._handle_event({"type": "DELETED", "object": deepcopy(cr)})
+    assert client.get(url).status_code == 404
+    assert client.get("/v1/sandboxes").json()["items"] == []
+
+
+def test_stale_ready_generation_is_not_running(persisted_fleet):
+    client, fake, _, sandbox_id = persisted_fleet
+    cr = fake.crs[("ns-1", sandbox_id)]
+    cr["metadata"]["generation"] = 2
+    assert client.get(f"/v1/sandboxes/{sandbox_id}").json()["status"]["state"] == "Pending"
+
+
+@pytest.mark.parametrize(
+    "fleets_config,namespace",
+    [
+        (None, "legacy"),
+        (FleetsRuntimeConfig(), "legacy"),
+        (FleetsRuntimeConfig(namespace="explicit"), "explicit"),
+    ],
+)
+def test_kubernetes_configuration_automatically_composes_fleets(
+    persisted_fleet, fleets_config, namespace
+):
+    _, _, fleets, _ = persisted_fleet
+    config = fleets._app_config.model_copy(
+        update={
+            "runtime": RuntimeConfig(type="kubernetes", execd_image="execd:test"),
+            "kubernetes": KubernetesRuntimeConfig(namespace="legacy"),
+            "fleets": fleets_config,
+        }
+    )
+    with patch("opensandbox_server.services.factory.KubernetesSandboxService") as constructor:
+        constructor.return_value.k8s_client = fleets._cr_reader._client
+        service = create_sandbox_service(config=config)
+    try:
+        assert isinstance(service, CompositeSandboxService)
+        assert service._fleets._resolve_namespace() == namespace
+        assert service._fleets._cr_reader._client is constructor.return_value.k8s_client
+    finally:
+        service.close()
+
+
+def test_mixed_list_globally_filters_sorts_and_pages(persisted_fleet, monkeypatch):
+    client, fake, fleets, sandbox_id = persisted_fleet
+    base = fleets.get_sandbox(sandbox_id)
+    cr = fake.crs[("ns-1", sandbox_id)]
+    cr["metadata"]["creationTimestamp"] = "2026-01-02T00:00:00Z"
+    legacy = Mock(spec=KubernetesSandboxService)
+    legacy.list_sandbox_objects.return_value = [
+        base.model_copy(
+            update={"id": "legacy-new", "created_at": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+        ),
+        base.model_copy(
+            update={"id": "legacy-tie", "created_at": datetime(2026, 1, 2, tzinfo=timezone.utc)}
+        ),
+        base.model_copy(update={"id": "legacy-filtered", "metadata": {"team": "other"}}),
+    ]
+    monkeypatch.setattr(lifecycle, "sandbox_service", CompositeSandboxService(legacy, fleets))
+    params = {"pageSize": 2, "metadata": "team=agents", "state": "Running"}
+    first = client.get("/v1/sandboxes", params=params).json()
+    second = client.get("/v1/sandboxes", params={**params, "page": 2}).json()
+    assert [item["id"] for item in first["items"]] == ["legacy-new", sandbox_id]
+    assert [item["id"] for item in second["items"]] == ["legacy-tie"]
+    assert first["pagination"]["totalItems"] == second["pagination"]["totalItems"] == 3
+    assert first["pagination"]["hasNextPage"] is True
+    assert second["pagination"]["hasNextPage"] is False
+
+    legacy.get_sandbox.return_value = base.model_copy(update={"id": "legacy-new"})
+    assert client.get("/v1/sandboxes/legacy-new").status_code == 200
+    assert client.get("/v1/sandboxes/flt-missing").status_code == 404
+    legacy.get_sandbox.assert_called_once_with("legacy-new")
+
+
+@pytest.mark.parametrize(
+    "failure,expected", [("absent", 200), ("forbidden", 503), ("list404", 503), ("legacy", 503)]
+)
+def test_mixed_list_never_hides_a_backend_failure(persisted_fleet, monkeypatch, failure, expected):
+    client, _, fleets, sandbox_id = persisted_fleet
+    legacy = Mock(spec=KubernetesSandboxService)
+    legacy.list_sandbox_objects.return_value = [
+        fleets.get_sandbox(sandbox_id).model_copy(update={"id": "legacy"})
+    ]
+    api = fleets._cr_reader._client.get_custom_objects_api()
+    if failure in ("absent", "forbidden"):
+        api.get_api_resources.side_effect = ApiException(status=404 if failure == "absent" else 403)
+    elif failure == "list404":
+        api.list_namespaced_custom_object.side_effect = ApiException(status=404)
+    else:
+        legacy.list_sandbox_objects.side_effect = ApiException(status=503)
+    monkeypatch.setattr(lifecycle, "sandbox_service", CompositeSandboxService(legacy, fleets))
+    response = client.get("/v1/sandboxes")
+    assert response.status_code == expected
+    if expected == 200:
+        assert [item["id"] for item in response.json()["items"]] == ["legacy"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_create_keeps_legacy_semantics(persisted_fleet):
+    _, _, fleets, _ = persisted_fleet
+    legacy = Mock(spec=KubernetesSandboxService)
+    service = CompositeSandboxService(legacy, fleets)
+    request = Mock()
+    assert await service.create_sandbox(request) is legacy.create_sandbox.return_value
+    legacy.create_sandbox.assert_awaited_once_with(request)
 
 
 def test_http_renew_and_delete_use_uid_fences(http_fleets):
@@ -542,6 +821,9 @@ def test_background_renew_resolves_tenant_namespace(http_fleets):
     ).json()["id"]
     sandbox = fake.sandboxes.pop(("ns-1", sandbox_id))
     fake.sandboxes[("tenant-a", sandbox_id)] = sandbox
+    cr = fake.crs.pop(("ns-1", sandbox_id))
+    cr["metadata"]["namespace"] = "tenant-a"
+    fake.crs[("tenant-a", sandbox_id)] = cr
     service.set_tenant_provider(
         SimpleNamespace(list_tenants=lambda: [SimpleNamespace(namespace="tenant-a")])
     )
