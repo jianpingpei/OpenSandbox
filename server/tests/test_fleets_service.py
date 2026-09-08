@@ -20,6 +20,7 @@
 from concurrent import futures
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -29,7 +30,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from kubernetes.client import ApiException, CustomObjectsApi, V1APIResource, V1APIResourceList
 
-from opensandbox_server.api import lifecycle
+from opensandbox_server.api import lifecycle, network_policy
 from opensandbox_server.api.schema import RenewSandboxExpirationRequest
 from opensandbox_server.config import (
     AppConfig,
@@ -102,6 +103,9 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
                 "image": request.image,
                 "command": list(request.command),
                 "poolRef": request.pool_ref,
+                "actionBindings": [
+                    {"handler": b.handler, "input": b.input} for b in request.action_bindings
+                ],
                 "expireTime": datetime.fromtimestamp(
                     request.expires_at_unix_seconds, timezone.utc
                 ).isoformat(),
@@ -172,6 +176,10 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
             cr["spec"]["expireTime"] = datetime.fromtimestamp(
                 request.expires_at_unix_seconds, timezone.utc
             ).isoformat()
+        if request.HasField("action_bindings"):
+            cr["spec"]["actionBindings"] = [
+                {"handler": b.handler, "input": b.input} for b in request.action_bindings.items
+            ]
         for key, value in request.metadata_upsert.items():
             cr["metadata"]["labels"][METADATA_PREFIX + key] = value
         for key in request.metadata_delete_keys:
@@ -286,6 +294,7 @@ def http_fleets(monkeypatch):
 
     app = FastAPI()
     app.include_router(lifecycle.router, prefix="/v1")
+    app.include_router(network_policy.router, prefix="/v1")
     try:
         with TestClient(app) as client:
             yield client, fake, service
@@ -494,6 +503,81 @@ def test_stale_ready_generation_is_not_running(persisted_fleet):
     cr = fake.crs[("ns-1", sandbox_id)]
     cr["metadata"]["generation"] = 2
     assert client.get(f"/v1/sandboxes/{sandbox_id}").json()["status"]["state"] == "Pending"
+
+
+def test_delete_uses_cr_identity_when_runtime_observation_is_gone(persisted_fleet):
+    client, fake, _, sandbox_id = persisted_fleet
+    uid = fake.crs[("ns-1", sandbox_id)]["metadata"]["uid"]
+    fake.get_error_by_namespace["ns-1"] = grpc.StatusCode.UNAVAILABLE
+    url = f"/v1/sandboxes/{sandbox_id}"
+    assert client.delete(url).status_code == 204
+    assert fake.last_delete.sandbox.expected_uid == uid
+    assert client.delete(url).status_code == 404
+
+
+def test_http_policy_replace_preserves_bindings_and_fences_updates(persisted_fleet):
+    client, fake, _, sandbox_id = persisted_fleet
+    url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
+    assert client.get(url).json()["policy"] == {"defaultAction": "deny", "egress": []}
+    bindings = [
+        {"handler": "audit", "input": '{"enabled":true}'},
+        {"handler": "egress", "input": " "},
+        {"handler": "other", "input": "{}"},
+    ]
+    cr = fake.crs[("ns-1", sandbox_id)]
+    cr["spec"]["actionBindings"] = bindings
+    assert client.get(url).json()["mode"] == "deny_all"
+    policy = {"defaultAction": "allow", "egress": []}
+    response = client.put(url, json=policy)
+    assert response.status_code == 200
+    assert response.json()["policy"] == policy
+    assert client.get(url).json()["policy"] == policy
+    assert list(fake.last_update.action_bindings.items)[0].input == bindings[0]["input"]
+    assert [b.handler for b in fake.last_update.action_bindings.items] == [
+        "audit",
+        "egress",
+        "other",
+    ]
+    assert fake.last_update.action_bindings.items[2].input == bindings[2]["input"]
+    assert json.loads(fake.last_update.action_bindings.items[1].input) == policy
+    assert fake.last_update.sandbox.expected_uid == cr["metadata"]["uid"]
+    assert fake.last_update.expected_generation == 1
+
+    fake.abort_update_with = grpc.StatusCode.ABORTED
+    assert client.put(url, json={"defaultAction": "deny"}).status_code == 409
+    assert client.get(url).json()["policy"] == policy
+
+
+def test_policy_rejects_invalid_input_and_other_tenant(persisted_fleet):
+    client, fake, _, sandbox_id = persisted_fleet
+    url = f"/v1/sandboxes/{sandbox_id}/networkpolicy"
+    for policy in ({"defaultAction": "invalid"}, {"egress": [{"action": "allow", "target": " "}]}):
+        assert client.put(url, json=policy).status_code == 400
+    assert fake.last_update is None
+    previous = get_current_tenant()
+    try:
+        set_current_tenant(TenantEntry(name="empty", namespace="empty"))
+        assert client.get(url).status_code == 404
+        assert client.put(url, json={"defaultAction": "allow"}).status_code == 404
+        assert fake.last_update is None
+    finally:
+        set_current_tenant(previous)
+
+
+def test_legacy_policy_route_preserves_body_for_existing_proxy(http_fleets, monkeypatch):
+    from starlette.responses import JSONResponse
+
+    client, _, _ = http_fleets
+
+    async def proxy(request, sandbox_id, port, path):
+        assert (sandbox_id, port, path) == ("legacy-id", 18080, "policy")
+        body = b"".join([part async for part in request.stream()])
+        return JSONResponse(json.loads(body) if body else {"status": "ok"})
+
+    monkeypatch.setattr(network_policy, "_proxy_http_request", proxy)
+    assert client.get("/v1/sandboxes/legacy-id/networkpolicy").json() == {"status": "ok"}
+    policy = {"defaultAction": "allow", "egress": []}
+    assert client.put("/v1/sandboxes/legacy-id/networkpolicy", json=policy).json() == policy
 
 
 @pytest.mark.parametrize(

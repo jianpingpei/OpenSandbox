@@ -25,11 +25,13 @@ ignored (see OSEP-0007 "Simplified Create").
 from __future__ import annotations
 
 import decimal
+import json
 import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from opensandbox_server.api.schema import CreateSandboxRequest
+from opensandbox_server.services.fleets.network_policy import normalized_policy
 from opensandbox_server.services.fleets.generated import (
     fastpath_pb2 as pb2,
 )
@@ -131,6 +133,11 @@ def map_create_request(
 
     if request.metadata:
         create.metadata.update(request.metadata)
+
+    if request.network_policy is not None:
+        create.action_bindings.add(
+            handler="egress", input=json.dumps(normalized_policy(request.network_policy))
+        )
 
     extensions = request.extensions or {}
     # Normalize before forwarding: a whitespace-only poolRef must not select
@@ -240,11 +247,6 @@ def _reject_unsupported_fields(request: CreateSandboxRequest) -> None:
     if request.volumes:
         raise UnsupportedFieldError(
             "volumes", "Fastlet child containers cannot receive dynamic mounts"
-        )
-    if request.network_policy is not None:
-        raise UnsupportedFieldError(
-            "networkPolicy",
-            "per-sandbox egress enforcement is deferred to phase 1b; not supported in phase 1a",
         )
     if request.secure_access:
         raise UnsupportedFieldError(

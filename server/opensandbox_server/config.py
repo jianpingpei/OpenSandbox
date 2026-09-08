@@ -934,10 +934,6 @@ class FleetsRuntimeConfig(BaseModel):
         default="default-pool",
         description="Default SandboxPool when extensions.poolRef is unset.",
     )
-    execd_component_name: str = Field(
-        default="execd",
-        description="Pool Infra Component used for public execd port 44772.",
-    )
 
 
 class SecureRuntimeConfig(BaseModel):

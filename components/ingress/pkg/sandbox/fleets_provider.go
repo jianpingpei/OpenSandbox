@@ -188,7 +188,7 @@ func (p *FleetsProvider) ResolveEndpoint(ctx context.Context, target EndpointTar
 		return nil, fmt.Errorf("invalid target port %d", target.Port)
 	}
 	if target.Port == EgressPort {
-		return nil, fmt.Errorf("%w: egress policy port %d is deferred to Phase 1b", ErrTargetUnsupported, EgressPort)
+		return nil, fmt.Errorf("%w: use the lifecycle networkpolicy API instead of port %d", ErrTargetUnsupported, EgressPort)
 	}
 	if cached, ok := p.cached(target); ok {
 		return &cached, nil
@@ -200,11 +200,8 @@ func (p *FleetsProvider) ResolveEndpoint(ctx context.Context, target EndpointTar
 		},
 		AccessMode: p.accessMode,
 	}
-	if target.Port == ExecdPort {
-		request.Target = &fastpathv2.EndpointTarget{Target: &fastpathv2.EndpointTarget_ComponentName{ComponentName: "execd"}}
-	} else {
-		request.Target = &fastpathv2.EndpointTarget{Target: &fastpathv2.EndpointTarget_Port{Port: uint32(target.Port)}}
-	}
+	// Execd is part of the workload image/template, not a runtime Infra Component.
+	request.Target = &fastpathv2.EndpointTarget{Target: &fastpathv2.EndpointTarget_Port{Port: uint32(target.Port)}}
 
 	rpcCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
 	defer cancel()

@@ -81,7 +81,7 @@ func TestFleetsProviderMatchesPythonWireContractOverGRPC(t *testing.T) {
 	require.NoError(t, provider.Start(ctx))
 	info, err := provider.ResolveEndpoint(ctx, EndpointTarget{Namespace: "tenant-a", SandboxID: "sandbox-123", Port: ExecdPort})
 	require.NoError(t, err)
-	require.Equal(t, "http://fastlet:5780/v2/sandboxes/uid-123/components/execd", info.UpstreamURL)
+	require.Equal(t, "http://fastlet:5780/v1/sandboxes/uid-123/ports/44772", info.UpstreamURL)
 	require.Equal(t, "issued-credential", info.UpstreamHeaders.Get(FastSandboxCredential))
 	require.Equal(t, time.Unix(2_000_000_060, 0), info.ExpiresAt)
 }
@@ -118,7 +118,8 @@ func TestFleetsProviderMapsTargetsAndCachesByNamespace(t *testing.T) {
 
 	require.Len(t, resolver.requests, 2)
 	for _, request := range resolver.requests {
-		require.Equal(t, "execd", request.GetTarget().GetComponentName())
+		require.Equal(t, uint32(ExecdPort), request.GetTarget().GetPort())
+		require.Empty(t, request.GetTarget().GetComponentName())
 		require.Equal(t, fastpathv2.EndpointAccessMode_CENTRAL_PROXY, request.GetAccessMode())
 		require.Zero(t, request.GetExpectedGeneration())
 	}

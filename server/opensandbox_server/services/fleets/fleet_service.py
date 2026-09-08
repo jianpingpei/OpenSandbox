@@ -37,6 +37,7 @@ from opensandbox_server.api.schema import (
     Endpoint,
     ListSandboxesRequest,
     ListSandboxesResponse,
+    NetworkPolicy,
     PatchSandboxMetadataRequest,
     RenewSandboxExpirationRequest,
     RenewSandboxExpirationResponse,
@@ -66,6 +67,7 @@ from opensandbox_server.services.fleets.fastpath_client import (
 from opensandbox_server.services.fleets.endpoint import build_endpoint
 from opensandbox_server.services.fleets.cr_reader import SandboxCRReader
 from opensandbox_server.services.fleets.cr_mapping import sandbox_from_cr
+from opensandbox_server.services.fleets.network_policy import normalized_policy, policy_status
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 from opensandbox_server.services.fleets.status_mapping import map_reason, map_state
 from opensandbox_server.services.sandbox_service import SandboxService
@@ -322,18 +324,15 @@ class FleetSandboxService(SandboxService, ExtensionService):
         return _build_list_sandboxes_response(self.list_sandbox_objects(), request)
 
     def delete_sandbox(self, sandbox_id: str) -> None:
-        """Preflight Get to preserve the public 404 contract, then submit an
-        async (finalizer-driven) deletion."""
-        namespace = self._resolve_namespace_for_lookup(sandbox_id)
-        try:
-            current = self._fastpath.get_sandbox(namespace, sandbox_id)
-        except FastPathError as exc:
-            raise self._fastpath_http_error(exc) from exc
+        # Runtime observations can disappear before the CR during finalization.
+        # Deletion needs durable identity, not a live Fastlet Get observation.
+        metadata = self._get_cr(sandbox_id)["metadata"]
+        namespace = metadata["namespace"]
         try:
             self._fastpath.delete_sandbox(
                 namespace,
                 sandbox_id,
-                expected_uid=current.sandbox.identity.uid,
+                expected_uid=metadata["uid"],
             )
         except FastPathError as exc:
             raise self._fastpath_http_error(exc) from exc
@@ -465,6 +464,48 @@ class FleetSandboxService(SandboxService, ExtensionService):
         )
 
     # -- endpoints ---------------------------------------------------------
+
+    def get_network_policy(self, sandbox_id: str) -> dict:
+        current = self._cr_reader.get(self._resolve_namespace(), sandbox_id)
+        binding = next(
+            (b for b in current["spec"].get("actionBindings", []) if b["handler"] == "egress"), None
+        )
+        try:
+            raw = binding.get("input") if binding else None
+            if isinstance(raw, str) and not raw.strip():
+                raw = None
+            policy = json.loads(raw) if raw is not None else None
+            if policy is not None:
+                policy = normalized_policy(NetworkPolicy.model_validate(policy))
+        except (ValueError, TypeError, HTTPException) as exc:
+            raise HTTPException(503, detail="Invalid persisted egress binding.") from exc
+        return policy_status(policy)
+
+    def replace_network_policy(self, sandbox_id: str, policy: NetworkPolicy) -> dict:
+        normalized = normalized_policy(policy)
+        current = self._cr_reader.get(self._resolve_namespace(), sandbox_id)
+        metadata = current["metadata"]
+        bindings = [dict(b) for b in current["spec"].get("actionBindings", [])]
+        replacement = {"handler": "egress", "input": json.dumps(normalized)}
+        for index, binding in enumerate(bindings):
+            if binding["handler"] == "egress":
+                bindings[index] = replacement
+                break
+        else:
+            bindings.append(replacement)
+        try:
+            self._fastpath.replace_action_bindings(
+                metadata["namespace"],
+                sandbox_id,
+                bindings,
+                expected_uid=metadata["uid"],
+                expected_generation=metadata["generation"],
+            )
+        except FastPathError as exc:
+            raise self._fastpath_http_error(exc) from exc
+        finally:
+            self._cr_reader.invalidate(metadata["namespace"])
+        return policy_status(normalized)
 
     def get_endpoint(
         self,

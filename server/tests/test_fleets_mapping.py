@@ -18,6 +18,7 @@
 """Unit tests for fleets create/status mapping (OSEP-0007 simplified create)."""
 
 from datetime import datetime, timezone
+import json
 
 import pytest
 
@@ -97,6 +98,17 @@ def test_map_create_request_defaults_pool_ref():
     assert create.pool_ref == "default-pool"
 
 
+def test_create_includes_network_policy_in_atomic_intent():
+    policy = NetworkPolicy(egress=[NetworkRule(action=" Allow ", target=" *.example.com ")])
+    create = map_create_request(_base_request(network_policy=policy), "sbx-1", "ns-1", now=NOW)
+    assert len(create.action_bindings) == 1
+    assert create.action_bindings[0].handler == "egress"
+    assert json.loads(create.action_bindings[0].input) == {
+        "defaultAction": "deny",
+        "egress": [{"action": "allow", "target": "*.example.com"}],
+    }
+
+
 def test_map_create_request_strips_pool_ref():
     # A whitespace-only poolRef must not reach FastPath; a padded name is
     # normalized before forwarding.
@@ -140,10 +152,6 @@ def test_map_create_request_rejects_renew_extension_until_it_has_a_read_path():
                     egress=[NetworkRule(action="allow", target="a.com")]
                 ),
             },
-        ),
-        (
-            "networkPolicy",
-            {"network_policy": NetworkPolicy(egress=[NetworkRule(action="allow", target="a.com")])},
         ),
         ("secureAccess", {"secure_access": True}),
         ("volumes", {"volumes": [_host_volume()]}),

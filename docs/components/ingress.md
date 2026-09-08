@@ -152,12 +152,17 @@ namespaces remain independent.
 ## Fleets Provider
 
 The Phase 1a fleets provider accepts only an authenticated internal fleets
-route scope. It resolves port
-`44772` as the named `execd` component and resolves other user ports as raw
-ports. Endpoint handles can be issued while a sandbox is pending; actual
+route scope. It resolves execd port `44772` and other user ports as raw
+ports. Execd must already be installed and started by the workload image/template;
+it is not delivered as a runtime Infra Component. Pools using the old named
+`execd` declaration must migrate to image/template-provided execd and remove
+that declaration: FastPath rejects raw-port access to declared component ports.
+Endpoint handles can be issued while a sandbox is pending; actual
 traffic receives `503` with `Retry-After` until FastPath publishes the route.
 Port `18080` handles are reserved for SDK compatibility and traffic returns
-`501` until the Phase 1b policy-manager route is available.
+`501`; use the authenticated Server `GET/PUT /sandboxes/{id}/networkpolicy`
+route instead. See [Server policy operations](/components/server#fleets-workload-and-network-policy)
+and the [real HTTP E2E suite](/guides/fleets-http-e2e).
 
 | Flag | Default | Description |
 |------|---------|-------------|

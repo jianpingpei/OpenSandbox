@@ -22,6 +22,7 @@ from opensandbox_server.api.schema import (
     Endpoint,
     ListSandboxesRequest,
     ListSandboxesResponse,
+    NetworkPolicy,
     PatchSandboxMetadataRequest,
     RenewSandboxExpirationRequest,
     RenewSandboxExpirationResponse,
@@ -109,6 +110,12 @@ class CompositeSandboxService(SandboxService, ExtensionService):
 
     def get_access_renew_extend_seconds(self, sandbox_id: str) -> int | None:
         return self._backend(sandbox_id).get_access_renew_extend_seconds(sandbox_id)
+
+    def get_network_policy(self, sandbox_id: str) -> dict:
+        return self._fleets.get_network_policy(sandbox_id)
+
+    def replace_network_policy(self, sandbox_id: str, policy: NetworkPolicy) -> dict:
+        return self._fleets.replace_network_policy(sandbox_id, policy)
 
     def get_sandbox_log_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
         return self._backend(sandbox_id).get_sandbox_log_diagnostics(sandbox_id, scope)

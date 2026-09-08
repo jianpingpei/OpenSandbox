@@ -234,6 +234,29 @@ class FastPathClient:
             )
         )
 
+    def replace_action_bindings(
+        self,
+        namespace: str,
+        sandbox_name: str,
+        bindings: list[dict],
+        *,
+        expected_uid: str,
+        expected_generation: int,
+    ) -> fastpath_pb2.UpdateSandboxResponse:
+        request = fastpath_pb2.UpdateSandboxRequest(
+            sandbox=namespaced_reference(namespace, sandbox_name, expected_uid=expected_uid),
+            expected_generation=expected_generation,
+            action_bindings=fastpath_pb2.ReplaceActionBindings(
+                items=[
+                    fastpath_pb2.ActionBinding(handler=b["handler"], input=b["input"])
+                    for b in bindings
+                ]
+            ),
+        )
+        return self._call(
+            lambda: self._require_stub().UpdateSandbox(request, timeout=self._timeout_seconds)
+        )
+
     # -- readiness / endpoints --------------------------------------------
 
     def resolve_endpoint(
