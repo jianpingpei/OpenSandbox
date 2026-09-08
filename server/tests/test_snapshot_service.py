@@ -168,19 +168,6 @@ def test_snapshot_service_rejects_create_when_source_sandbox_not_running(tmp_pat
     assert runtime.calls == []
 
 
-def test_snapshot_service_rejects_fleets_without_persisting_or_calling_legacy(tmp_path) -> None:
-    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
-    runtime = StubSnapshotRuntime()
-    service = PersistedSnapshotService(
-        repo, StubSandboxService(), snapshot_runtime=runtime, snapshot_executor=ImmediateExecutor()
-    )
-    with pytest.raises(HTTPException) as exc_info:
-        service.create_snapshot("flt-001", CreateSnapshotRequest())
-    assert exc_info.value.status_code == 501
-    assert service.list_snapshots(ListSnapshotsRequest()).items == []
-    assert runtime.calls == []
-
-
 def test_snapshot_service_rejects_create_when_source_sandbox_state_missing(tmp_path) -> None:
     repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
     runtime = StubSnapshotRuntime()
@@ -648,3 +635,16 @@ def test_snapshot_service_recovers_deleting_snapshot(tmp_path) -> None:
 
     assert runtime.delete_calls == [("snap-delete", "opensandbox-snapshots:snap-delete")]
     assert repo.get("snap-delete") is None
+
+
+def test_snapshot_service_rejects_fleets_without_persisting_or_calling_legacy(tmp_path) -> None:
+    repo = SQLiteSnapshotRepository(tmp_path / "snapshots.db")
+    runtime = StubSnapshotRuntime()
+    service = PersistedSnapshotService(
+        repo, StubSandboxService(), snapshot_runtime=runtime, snapshot_executor=ImmediateExecutor()
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        service.create_snapshot("flt-001", CreateSnapshotRequest())
+    assert exc_info.value.status_code == 501
+    assert service.list_snapshots(ListSnapshotsRequest()).items == []
+    assert runtime.calls == []
