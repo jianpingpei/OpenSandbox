@@ -164,7 +164,7 @@ Port `18080` handles are reserved for SDK compatibility and traffic returns
 | `--provider-type` | `batchsandbox` | Select the legacy Kubernetes provider, or set to `fleets` for fleets-only routing |
 | `--fastpath-endpoint` | empty | FastPath v2 gRPC endpoint; a non-empty value enables fleets routing |
 | `--fastpath-access-mode` | `direct-fastlet-proxy` | Use `central-proxy` when ingress cannot reach Fastlet Pod IPs |
-| `--fastpath-wait-timeout-millis` | `2000` | Bounded readiness wait for one request |
+| `--fastpath-wait-timeout-millis` | `2000` | Deadline for one FastPath ResolveEndpoint RPC |
 | `--secure-access-keys` | empty | Shared signing key ring; required for fleets route-scope verification |
 
 With `--provider-type=batchsandbox` and a non-empty `--fastpath-endpoint`, one ingress serves both
@@ -202,6 +202,57 @@ namespace when the two systems are deployed in different namespaces.
 Fleets supports Header and URI route scopes in Phase 1a. Wildcard-host scopes
 are not supported because the authenticated namespace, sandbox ID, and MAC do
 not fit safely in one DNS label.
+
+### Server-issued Fleets endpoints
+
+The Fleets Server adapter returns a stable route from
+`GET /sandboxes/{sandboxId}/endpoints/{port}` without calling FastPath or waiting
+for readiness. It signs the authenticated tenant namespace, sandbox ID, and port
+using the existing ingress signing configuration. Without multi-tenancy, it uses
+the configured Fleets namespace. This does not change backend selection or
+implement template-based creation and the incomplete Sandbox read APIs.
+
+Configure the Server with a gateway and a key also present in the Ingress
+`--secure-access-keys` key ring:
+
+```toml
+[ingress]
+mode = "gateway"
+
+[ingress.gateway]
+address = "ingress.example.com"
+
+[ingress.gateway.route]
+mode = "header" # or "uri"
+
+[ingress.secure_access]
+active_key = "k"
+
+[[ingress.secure_access.keys]]
+key_id = "k"
+key = "<base64-encoded-secret>"
+```
+
+Header mode returns the gateway address and an `OpenSandbox-Ingress-To: f1.*`
+header. URI mode returns `<gateway-address>/f1.*`. Clients must preserve the
+returned route and headers. These scopes have no embedded expiration, so the
+Fleets adapter rejects the optional `expires` parameter rather than silently
+issuing a non-expiring route. Missing signing keys, direct mode, and wildcard
+mode are also rejected. Endpoint discovery does not establish sandbox existence;
+Ingress performs the tenant-scoped lookup when traffic arrives.
+
+Ingress resolves the upstream address and short-lived credential only when a
+request arrives. A FastPath `FailedPrecondition` (including a not-ready route)
+returns `503` with `Retry-After`; it is not a missing Sandbox. Port `18080` handles
+can be issued, but the policy proxy is not implemented in this adapter yet and
+actual traffic still returns `501`.
+
+The Ingress protobuf subset matches FastSandbox commit
+`11b21bf6a6ce730d48ea6e3e3d0050db2607ae49`, also verified against the Server Python
+protobuf. `ResolveEndpoint` no longer accepts `wait_until_ready` or
+`wait_timeout_millis`; the existing timeout flag bounds the RPC itself. The
+shared wire fixture in `components/ingress/pkg/fastpath/v2/testdata` is exercised
+by both Python and Go tests.
 
 The `f1.` prefix is reserved for fleets route scopes. A legacy route whose first
 host or URI segment starts with `f1.` is treated as a fleets route and returns

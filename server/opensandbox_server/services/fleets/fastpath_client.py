@@ -74,6 +74,10 @@ class FastPathConflict(FastPathError):
     """The FastPath request conflicts with existing durable state."""
 
 
+class FastPathResourceExhausted(FastPathError):
+    """The FastPath pool has insufficient capacity for the request."""
+
+
 class FastPathClient:
     """Synchronous gRPC client for the fast-sandbox FastPathService v2 API."""
 
@@ -295,6 +299,8 @@ def _to_fastpath_error(exc: grpc.RpcError) -> FastPathError:
         return FastPathNotFound(code.name, details)
     if code == grpc.StatusCode.INVALID_ARGUMENT:
         return FastPathInvalidArgument(code.name, details)
+    if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+        return FastPathResourceExhausted(code.name, details)
     if code in (grpc.StatusCode.ALREADY_EXISTS, grpc.StatusCode.ABORTED):
         return FastPathConflict(code.name, details)
     if code in (

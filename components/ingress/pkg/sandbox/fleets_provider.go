@@ -195,12 +195,10 @@ func (p *FleetsProvider) ResolveEndpoint(ctx context.Context, target EndpointTar
 	}
 
 	request := &fastpathv2.ResolveEndpointRequest{
-		Sandbox: &fastpathv2.SandboxReference{Reference: &fastpathv2.SandboxReference_NamespacedName{
+		Sandbox: &fastpathv2.SandboxReference{
 			NamespacedName: &fastpathv2.NamespacedName{Namespace: target.Namespace, Name: target.SandboxID},
-		}},
-		AccessMode:        p.accessMode,
-		WaitUntilReady:    true,
-		WaitTimeoutMillis: int32(p.waitTimeout.Milliseconds()),
+		},
+		AccessMode: p.accessMode,
 	}
 	if target.Port == ExecdPort {
 		request.Target = &fastpathv2.EndpointTarget{Target: &fastpathv2.EndpointTarget_ComponentName{ComponentName: "execd"}}
@@ -208,7 +206,7 @@ func (p *FleetsProvider) ResolveEndpoint(ctx context.Context, target EndpointTar
 		request.Target = &fastpathv2.EndpointTarget{Target: &fastpathv2.EndpointTarget_Port{Port: uint32(target.Port)}}
 	}
 
-	rpcCtx, cancel := context.WithTimeout(ctx, p.waitTimeout+5*time.Second)
+	rpcCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
 	defer cancel()
 	response, err := p.resolver.ResolveEndpoint(rpcCtx, request)
 	if err != nil {
@@ -313,7 +311,7 @@ func mapFastPathError(err error) error {
 	switch status.Code(err) {
 	case codes.NotFound:
 		public = fmt.Errorf("%w: sandbox not found", ErrSandboxNotFound)
-	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted, codes.FailedPrecondition:
 		public = fmt.Errorf("%w: FastPath resolution temporarily unavailable", ErrSandboxNotReady)
 	case codes.Canceled:
 		public = errors.New("FastPath resolution canceled")

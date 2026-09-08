@@ -20,6 +20,7 @@
 from concurrent import futures
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import grpc
 import pytest
@@ -31,6 +32,7 @@ from opensandbox_server.api.schema import RenewSandboxExpirationRequest
 from opensandbox_server.config import (
     AppConfig,
     FleetsRuntimeConfig,
+    IngressConfig,
     RuntimeConfig,
     ServerConfig,
 )
@@ -39,6 +41,8 @@ from opensandbox_server.services.fleets.fleet_service import FleetSandboxService
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 from opensandbox_server.services.fleets.generated import fastpath_pb2_grpc as pb2_grpc
 from opensandbox_server.services.snapshot_runtime_factory import create_snapshot_runtime
+from opensandbox_server.tenants.context import get_current_tenant, set_current_tenant
+from opensandbox_server.tenants.models import TenantEntry
 
 
 class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
@@ -50,6 +54,8 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
         self.last_delete: pb2.DeleteRequest | None = None
         self.abort_update_with: grpc.StatusCode | None = None
         self.abort_create_with: grpc.StatusCode | None = None
+        self.reject_create_with: grpc.StatusCode | None = None
+        self.create_pending = False
         self.create_time_remaining: float | None = None
         self.diagnostic_runtime_state = pb2.RUNTIME_STATE_READY
         self.pool_has_resources = True
@@ -67,13 +73,20 @@ class _FakeFastPathService(pb2_grpc.FastPathServiceServicer):
 
     def CreateSandbox(self, request, context):
         self.last_create = request
+        if self.reject_create_with is not None:
+            context.abort(self.reject_create_with, "scripted rejection before persistence")
         self.create_time_remaining = context.time_remaining()
         uid = f"uid-{request.request_id}"
         self.sandboxes[(request.namespace, request.request_id)] = (uid, 1)
         if self.abort_create_with is not None:
             context.abort(self.abort_create_with, "scripted post-persistence failure")
+        info = self._info(request.request_id, uid, request.namespace)
+        if self.create_pending:
+            info.runtime.state = pb2.RUNTIME_STATE_CREATING
+            info.data_plane.state = pb2.DATA_PLANE_STATE_PENDING
+            info.ready = False
         return pb2.CreateSandboxResponse(
-            sandbox=self._info(request.request_id, uid, request.namespace),
+            sandbox=info,
             generation=1,
             completion=request.completion,
         )
@@ -395,7 +408,7 @@ def test_event_diagnostics_enforce_stable_scope_contract(http_fleets):
     }
 
 
-@pytest.mark.parametrize("operation", ["logs", "pause", "resume", "endpoint"])
+@pytest.mark.parametrize("operation", ["logs", "pause", "resume"])
 def test_unsupported_fleets_operations_are_explicit(http_fleets, operation):
     _, _, service = http_fleets
 
@@ -406,9 +419,105 @@ def test_unsupported_fleets_operations_are_explicit(http_fleets, operation):
             service.pause_sandbox("flt-1")
         elif operation == "resume":
             service.resume_sandbox("flt-1")
-        else:
-            service.get_endpoint("flt-1", 44772)
 
+    assert exc_info.value.status_code == 501
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_http_create_handles_capacity_rejection_and_accepted_pending(http_fleets, pending):
+    client, fake, _ = http_fleets
+    fake.create_pending = pending
+    if not pending:
+        fake.reject_create_with = grpc.StatusCode.RESOURCE_EXHAUSTED
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 60,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+    if pending:
+        assert response.status_code == 202
+        assert response.json()["status"]["state"] == "Pending"
+    else:
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "1"
+
+
+def _gateway_config(mode="header"):
+    return IngressConfig.model_validate(
+        {
+            "mode": "gateway",
+            "gateway": {
+                "address": "*.example.com" if mode == "wildcard" else "ingress.example.com",
+                "route": {"mode": mode},
+            },
+            "secure_access": {
+                "active_key": "k",
+                "keys": [{"key_id": "k", "key": "c2hhcmVkLXNlY3JldA=="}],
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", ["header", "uri"])
+def test_http_endpoint_matches_go_scope_without_fastpath_lookup(http_fleets, monkeypatch, mode):
+    client, _, service = http_fleets
+    service._app_config.ingress = _gateway_config(mode)
+    fastpath = Mock(spec=FastPathClient)
+    monkeypatch.setattr(service, "_fastpath", fastpath)
+    previous = get_current_tenant()
+    set_current_tenant(TenantEntry(name="tenant-a", namespace="tenant-a"))
+    try:
+        response = client.get(
+            "/v1/sandboxes/sandbox-123/endpoints/44772",
+            headers={"X-Namespace": "attacker"},
+        )
+    finally:
+        set_current_tenant(previous)
+    assert response.status_code == 200
+    scope = "f1.dGVuYW50LWE.c2FuZGJveC0xMjM.44772.k.uo11HjECmnSuCCRF3v-1AQ"
+    body = response.json()
+    if mode == "header":
+        assert body == {
+            "endpoint": "ingress.example.com",
+            "headers": {"OpenSandbox-Ingress-To": scope},
+        }
+    else:
+        assert body["endpoint"] == f"ingress.example.com/{scope}"
+        assert not body.get("headers")
+    assert fastpath.mock_calls == []
+
+
+@pytest.mark.parametrize("port", [8080, 18080])
+def test_endpoint_binds_port_and_default_namespace(http_fleets, port):
+    client, _, service = http_fleets
+    service._app_config.ingress = _gateway_config()
+    response = client.get(f"/v1/sandboxes/flt-123/endpoints/{port}")
+    assert response.status_code == 200
+    scope = response.json()["headers"]["OpenSandbox-Ingress-To"]
+    assert scope.startswith(f"f1.bnMtMQ.Zmx0LTEyMw.{port}.k.")
+
+
+@pytest.mark.parametrize(
+    "invalid", ["no_gateway", "no_keys", "wildcard", "expires", "port", "identity"]
+)
+def test_endpoint_rejects_unsupported_or_invalid_routes(http_fleets, invalid):
+    _, _, service = http_fleets
+    config = service._app_config
+    config.ingress = _gateway_config("wildcard" if invalid == "wildcard" else "header")
+    if invalid == "no_gateway":
+        config.ingress = None
+    elif invalid == "no_keys":
+        config.ingress.secure_access = None
+    with pytest.raises(HTTPException) as exc_info:
+        service.get_endpoint(
+            "bad\nidentity" if invalid == "identity" else "flt-123",
+            0 if invalid == "port" else 44772,
+            expires=2_000_000_000 if invalid == "expires" else None,
+        )
     assert exc_info.value.status_code == 400
 
 

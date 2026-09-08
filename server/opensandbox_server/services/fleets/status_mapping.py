@@ -32,11 +32,6 @@ from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 
 def map_state(info: pb2.SandboxInfo) -> str:
     """Map a fast-sandbox SandboxInfo to the OpenSandbox lifecycle state."""
-    if (
-        info.runtime.state == pb2.RUNTIME_STATE_STOPPING
-        or info.data_plane.state == pb2.DATA_PLANE_STATE_DRAINING
-    ):
-        return "Stopping"
     if info.runtime.state == pb2.RUNTIME_STATE_STOPPED:
         return "Terminated"
     if info.runtime.state in (
@@ -53,6 +48,11 @@ def map_state(info: pb2.SandboxInfo) -> str:
         return "Failed"
     if any(binding.state == pb2.ACTION_STATE_FAILED for binding in info.action_bindings):
         return "Failed"
+    if (
+        info.runtime.state == pb2.RUNTIME_STATE_STOPPING
+        or info.data_plane.state == pb2.DATA_PLANE_STATE_DRAINING
+    ):
+        return "Stopping"
     if info.ready:
         return "Running"
     return "Pending"

@@ -60,8 +60,10 @@ from opensandbox_server.services.fleets.fastpath_client import (
     FastPathError,
     FastPathInvalidArgument,
     FastPathNotFound,
+    FastPathResourceExhausted,
     FastPathUnavailable,
 )
+from opensandbox_server.services.fleets.endpoint import build_endpoint
 from opensandbox_server.services.fleets.generated import fastpath_pb2 as pb2
 from opensandbox_server.services.fleets.status_mapping import map_reason, map_state
 from opensandbox_server.services.sandbox_service import SandboxService
@@ -299,10 +301,10 @@ class FleetSandboxService(SandboxService, ExtensionService):
             raise self._fastpath_http_error(exc) from exc
 
     def pause_sandbox(self, sandbox_id: str) -> None:
-        raise self._unsupported("pause")
+        raise self._unsupported("pause", status.HTTP_501_NOT_IMPLEMENTED)
 
     def resume_sandbox(self, sandbox_id: str) -> None:
-        raise self._unsupported("resume")
+        raise self._unsupported("resume", status.HTTP_501_NOT_IMPLEMENTED)
 
     def renew_expiration(
         self,
@@ -337,7 +339,7 @@ class FleetSandboxService(SandboxService, ExtensionService):
     # -- diagnostics -------------------------------------------------------
 
     def get_sandbox_log_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
-        raise self._unsupported("sandbox logs")
+        raise self._unsupported("sandbox logs", status.HTTP_501_NOT_IMPLEMENTED)
 
     def get_sandbox_event_diagnostics(self, sandbox_id: str, scope: str) -> DiagnosticResult:
         normalized_scope = scope.strip().lower()
@@ -364,7 +366,7 @@ class FleetSandboxService(SandboxService, ExtensionService):
     ) -> str:
         # FastPath diagnostics carry lifecycle events only; process output
         # flows through execd, which has no sandbox-log endpoint.
-        raise self._unsupported("sandbox logs")
+        raise self._unsupported("sandbox logs", status.HTTP_501_NOT_IMPLEMENTED)
 
     def get_sandbox_inspect(self, sandbox_id: str) -> str:
         return self._lifecycle_diagnostics(sandbox_id, "events", "inspect").content
@@ -413,9 +415,9 @@ class FleetSandboxService(SandboxService, ExtensionService):
         expires: Optional[int] = None,
         use_proxy_host: bool = False,
     ) -> Endpoint:
-        # The stable tenant-scoped gateway route (T6, OSEP-0007 Phase 1a)
-        # is not implemented yet; endpoint discovery is a separate work item.
-        raise self._unsupported("get_endpoint on fleets (phase 1a)")
+        return build_endpoint(
+            self._app_config.ingress, self._resolve_namespace(), sandbox_id, port, expires
+        )
 
     # -- ExtensionService --------------------------------------------------
 
@@ -424,9 +426,11 @@ class FleetSandboxService(SandboxService, ExtensionService):
 
     # -- helpers -----------------------------------------------------------
 
-    def _unsupported(self, feature: str) -> HTTPException:
+    def _unsupported(
+        self, feature: str, status_code: int = status.HTTP_400_BAD_REQUEST
+    ) -> HTTPException:
         return HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status_code,
             detail={
                 "code": SandboxErrorCodes.FLEETS_UNSUPPORTED,
                 "message": f"{feature} is not supported on fleets (OSEP-0007 Phase 1a).",
@@ -435,6 +439,15 @@ class FleetSandboxService(SandboxService, ExtensionService):
 
     def _fastpath_http_error(self, exc: FastPathError) -> HTTPException:
         """Map a typed FastPath error to the public HTTP contract."""
+        if isinstance(exc, FastPathResourceExhausted):
+            return HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": "1"},
+                detail={
+                    "code": SandboxErrorCodes.FLEETS_API_ERROR,
+                    "message": "FastPath pool capacity is temporarily unavailable.",
+                },
+            )
         if isinstance(exc, FastPathNotFound):
             return HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

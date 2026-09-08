@@ -18,6 +18,8 @@
 """Focused tests for the synchronous FastPath v2 gRPC adapter."""
 
 from concurrent import futures
+import json
+from pathlib import Path
 from threading import Event, Thread
 
 import grpc
@@ -30,6 +32,7 @@ from opensandbox_server.services.fleets.fastpath_client import (
     FastPathError,
     FastPathInvalidArgument,
     FastPathNotFound,
+    FastPathResourceExhausted,
     FastPathUnavailable,
     component_target,
     namespaced_reference,
@@ -215,6 +218,7 @@ def test_error_mapping_covers_common_codes():
     cases = [
         (grpc.StatusCode.NOT_FOUND, FastPathNotFound),
         (grpc.StatusCode.INVALID_ARGUMENT, FastPathInvalidArgument),
+        (grpc.StatusCode.RESOURCE_EXHAUSTED, FastPathResourceExhausted),
         (grpc.StatusCode.ALREADY_EXISTS, FastPathConflict),
         (grpc.StatusCode.ABORTED, FastPathConflict),
         (grpc.StatusCode.UNAVAILABLE, FastPathUnavailable),
@@ -226,6 +230,29 @@ def test_error_mapping_covers_common_codes():
         error = fastpath_client._to_fastpath_error(_ScriptedRpcError(code))
         assert isinstance(error, expected)
         assert error.code == code.name
+
+
+def test_resolve_endpoint_matches_shared_wire_fixture():
+    fixture_path = (
+        Path(__file__).resolve().parents[2]
+        / "components/ingress/pkg/fastpath/v2/testdata/resolve_endpoint.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    request = pb2.ResolveEndpointRequest(
+        sandbox=namespaced_reference("tenant-a", "sandbox-123"),
+        target=component_target("execd"),
+        access_mode=pb2.DIRECT_FASTLET_PROXY,
+    )
+    response = pb2.ResolveEndpointResponse(
+        sandbox_uid="uid-123",
+        endpoint=pb2.ResolvedEndpoint(component_name="execd", protocol="http", port=44772),
+        proxy_endpoint="http://fastlet:5780/v2/sandboxes/uid-123/components/execd",
+        required_headers={"X-Fast-Sandbox-Route-Credential": "issued-credential"},
+        route_generation=7,
+        expires_at_unix_seconds=2000000060,
+    )
+    assert request.SerializeToString(deterministic=True).hex() == fixture["request_hex"]
+    assert response.SerializeToString(deterministic=True).hex() == fixture["response_hex"]
 
 
 def test_concurrent_first_use_waits_for_stub_publication(monkeypatch):
