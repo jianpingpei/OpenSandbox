@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: egress-network-security-rules
+  namespace: opensandbox-dataplane
+data:
+  deny.always: |
+    10.0.0.0/8
+    172.30.0.0/24
+  allow.always: |
+    example.com
+  reachable.ports.cap: |
+    53
+    80
+    443

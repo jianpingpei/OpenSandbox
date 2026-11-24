@@ -1,0 +1,21 @@
+apiVersion: sandbox.fast.io/v1alpha2
+kind: SandboxTemplate
+metadata:
+  name: envd-only-egress-probe
+  namespace: opensandbox-dataplane
+spec:
+  image: <IMAGE_REF>
+  kernel: vmlinux.bin
+  machine:
+    vcpu: "1"
+    memory: "512Mi"
+  entrypoint: ["/usr/local/bin/envd", "-isnotfc", "-no-cgroups", "-verbose"]
+  readiness:
+    warmupSeconds: 1
+    probe: "cmd://curl -sf -o /dev/null http://127.0.0.1:49983/health"
+  output:
+    rootfsSize: 4Gi
+    format: native
+    publish: s3://sandbox-images/publish
+    publishSecretRef:
+      name: sandbox-oss-credentials

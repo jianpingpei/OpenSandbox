@@ -1,0 +1,48 @@
+apiVersion: sandbox.fast.io/v1alpha2
+kind: Sandbox
+metadata:
+  name: sbx-envd-allow
+  namespace: opensandbox-dataplane
+spec:
+  image: <IMAGE_REF>
+  poolRef: firecracker-egress-pool
+  actionBindings:
+  - handler: egress
+    input: '{"defaultAction":"allow","egress":[]}'
+---
+apiVersion: sandbox.fast.io/v1alpha2
+kind: Sandbox
+metadata:
+  name: sbx-envd-deny
+  namespace: opensandbox-dataplane
+spec:
+  image: <IMAGE_REF>
+  poolRef: firecracker-egress-pool
+  actionBindings:
+  - handler: egress
+    input: '{"defaultAction":"deny","egress":[{"action":"allow","target":"echo.test"},{"action":"allow","target":"<ECHO_IP>"},{"action":"allow","target":"example.com"}]}'
+---
+apiVersion: sandbox.fast.io/v1alpha2
+kind: Sandbox
+metadata:
+  name: sbx-envd-sibling
+  namespace: opensandbox-dataplane
+spec:
+  image: <IMAGE_REF>
+  poolRef: firecracker-egress-pool
+  actionBindings:
+  - handler: egress
+    input: '{"defaultAction":"allow","egress":[]}'
+---
+# Negative control: malformed JSON must fail SET_BINDING and keep Ready=False
+apiVersion: sandbox.fast.io/v1alpha2
+kind: Sandbox
+metadata:
+  name: sbx-envd-bad-json
+  namespace: opensandbox-dataplane
+spec:
+  image: <IMAGE_REF>
+  poolRef: firecracker-egress-pool
+  actionBindings:
+  - handler: egress
+    input: '{"broken'

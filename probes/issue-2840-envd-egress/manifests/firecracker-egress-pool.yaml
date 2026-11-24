@@ -1,0 +1,114 @@
+apiVersion: sandbox.fast.io/v1alpha2
+kind: SandboxPool
+metadata:
+  name: firecracker-egress-pool
+  namespace: opensandbox-dataplane
+spec:
+  fastletTemplate:
+    spec:
+      containers:
+      - name: fastlet
+        image: <FASTLET_IMAGE>
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: FAST_SANDBOX_RUNTIME_AGENT_SOCKET
+          value: /run/fast-sandbox/firecracker/runtime.sock
+        - name: FAST_SANDBOX_SNAPSHOT_SPILL_DIR
+          value: /spill
+        volumeMounts:
+        - name: agent-socket
+          mountPath: /run/fast-sandbox/firecracker
+        - name: snapshot-spill
+          mountPath: /spill
+      - name: egress
+        image: <EGRESS_IMAGE>
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: OPENSANDBOX_EGRESS_PROFILE
+          value: "fast-sandbox"
+        - name: OPENSANDBOX_EGRESS_MODE
+          value: "dns+nft"
+        - name: OPENSANDBOX_EGRESS_VAULT_DIR
+          value: /var/lib/opensandbox-egress/vault
+        - name: OPENSANDBOX_EGRESS_POLICY_DIR
+          value: /var/lib/opensandbox-egress/policy
+        - name: OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT
+          value: "true"
+        - name: OPENSANDBOX_EGRESS_MITM_CA_SEED_DIR
+          value: /var/egress/mitm-ca-seed
+        - name: OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA
+          value: /var/egress/mitm-ca-seed/tls.crt
+        volumeMounts:
+        - name: egress-vault
+          mountPath: /var/lib/opensandbox-egress
+        - name: firecracker-state
+          mountPath: /var/lib/fast-sandbox/firecracker
+        - name: mitm-ca-seed
+          mountPath: /var/egress/mitm-ca-seed
+          readOnly: true
+        - name: egress-rules
+          mountPath: /var/egress/rules
+          readOnly: true
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+            - NET_RAW
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      volumes:
+      - name: agent-socket
+        hostPath:
+          path: /run/fast-sandbox/firecracker
+          type: DirectoryOrCreate
+      - name: snapshot-spill
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      - name: egress-vault
+        emptyDir: {}
+      - name: egress-rules
+        configMap:
+          name: egress-network-security-rules
+          optional: true
+      - name: mitm-ca-seed
+        secret:
+          secretName: opensandbox-mitm-ca-v1
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+      nodeSelector:
+        fast-sandbox.io/firecracker-node: "true"
+  capacity:
+    poolMin: 1
+    poolMax: 1
+    bufferMin: 0
+    bufferMax: 0
+  maxSandboxesPerPod: 5
+  runtime: firecracker
+  infraComponents:
+  - name: egress
+    delivery: host-process
+    process:
+      command: ["/bin/egress"]
+      healthCheck:
+        tcpConnect: {}
+        timeoutSeconds: 10
+    endpoint:
+      protocol: HTTP
+      port: 18080
+  actionHandlers:
+  - name: egress
+    targetHTTPPort: 18080
+    hooks: [sandbox.runtime-ready, sandbox.data-plane-ready]
+  sandboxResources:
+    cpu: "1"
+    memory: 512Mi
+    pids: 128
