@@ -76,3 +76,7 @@ python3 scripts/probe_ingress_streaming.py \
   --api-key <OPEN_SANDBOX_API_KEY> \
   --sandbox-id <SANDBOX_ID>
 ```
+
+## 7. Pause/resume continuity, clock sync, and clone isolation (P1-3)
+
+See [p1-3-pause-resume/report.md](./p1-3-pause-resume/report.md) and [p1-3-pause-resume/evidence/](./p1-3-pause-resume/evidence/) for same-Fastlet and cross-Fastlet pause/esume continuity, guest clock drift and same-token re-/init sync, clone token isolation, envd kill -9 crash behavior, and two infrastructure bugs uncovered during testing.
