@@ -56,3 +56,23 @@ kubectl -n opensandbox-dataplane exec -i <fastlet-pod> -c egress -- \
   --ca-pem-b64 "$(base64 -w0 ./mitm-ca/tls.crt)" --dummy-pem-b64 "$(base64 -w0 ./mitm-ca/dummy.crt)" \
   < scripts/probe_l7_mitm.py
 ```
+
+## 5. Run envd `/init`, default-user, and sticky `/tmp` checks (P0-2)
+
+Run inside a clean `envd-only` container with `python3` to verify `/init` `ReplaceUserVars`, `timestamp` ordering, restart memory wipe, `defaultUser` behavior, and `fs.protected_regular=2` sticky `/tmp` overwrite `HTTP 500`:
+
+```bash
+docker run --rm -i --entrypoint python3 -v "$PWD/scripts/probe_init_and_tmp.py:/probe_init_and_tmp.py:ro" \
+  crpi-m4ebzf3qn4yixelo.cn-hangzhou.personal.cr.aliyuncs.com/jianpingpei/envd-only:probe-p01 /probe_init_and_tmp.py
+```
+
+## 6. Run `server -> ingress -> fastlet -> envd` streaming & HTTP/2 checks (P1-2)
+
+With `opensandbox-server` and `opensandbox-ingress-gateway` deployed and an `fsb-*` envd-only sandbox (`<SANDBOX_ID>`) running on `firecracker-egress-pool`:
+
+```bash
+python3 scripts/probe_ingress_streaming.py \
+  --server-url http://<SERVER_HOST>:<SERVER_PORT> \
+  --api-key <OPEN_SANDBOX_API_KEY> \
+  --sandbox-id <SANDBOX_ID>
+```
