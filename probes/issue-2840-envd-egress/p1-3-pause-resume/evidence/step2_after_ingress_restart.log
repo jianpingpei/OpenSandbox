@@ -1,0 +1,13 @@
+GET endpoint: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1jcm9zcw.49983.a.s9FzNsj4ZxjUr-sNB-BLXg'}}
+GET /health after ingress restart: 204 
+Wrong token after cross-Fastlet resume: 401 {"code":401,"message":"unauthorized access, please provide a valid access token or method signing if supported"}
+
+CROSS-FASTLET exec: 200 end= {'exited': True, 'status': 'exit status 0'}
+SENTINEL=p13-cross-sentinel
+COUNTER_1=404 1795675343
+COUNTER_2=406 1795675345
+PS_COUNTER=1
+ENV_POST=cross-fastlet|2
+NS_EXAMPLE=Server:		172.30.0.1 Address:	172.30.0.1#53  Non-authoritative answer: Name:	example.com Address: 104.20.23.154 Name:	example.com Address: 172.66.147.243 Name:	example.com Address: 2606:4700:10::6814:179a Name:	example.com Address: 2606:4700:10::ac42:93f3  
+NS_HTTPBIN=;; Got recursion not available from 172.30.0.1 Server:		172.30.0.1 Address:	172.30.0.1#53  ** server can't find httpbin.org: NXDOMAIN  
+

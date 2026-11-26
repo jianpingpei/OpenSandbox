@@ -1,0 +1,35 @@
+GET sandbox: 200 {"state": "Running", "reason": "Ready", "message": "Runtime, data plane, Infra Components, and Action Bindings are Ready", "lastTransitionAt": "2026-11-26T06:29:37Z"}
+GET endpoint: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1tYWlu.49983.a.-wOKImKLloToX3V1DuxL6w'}}
+POST /init (initial, attempt=2): 204 host_utc= 2026-11-26T06:29:38Z
+PREP exec: 200 host_utc_pre= 1795674580 end= {'exited': True, 'status': 'exit status 0'}
+PID=622
+SENTINEL=p13-sentinel-v1
+COUNTER_PRE=2 1795674579
+ENV_PRE=alive-across-pause|1
+GUEST_UTC_PRE=1795674580
+NS_EXAMPLE=Server:		172.30.0.1 Address:	172.30.0.1#53  Non-authoritative answer: Name:	example.com Address: 104.20.23.154 Name:	example.com Address: 172.66.147.243 Name:	example.com Address: 2606:4700:10::6814:179a Name:	example.com Address: 2606:4700:10::ac42:93f3  
+NS_HTTPBIN=;; Got recursion not available from 172.30.0.1 Server:		172.30.0.1 Address:	172.30.0.1#53  ** server can't find httpbin.org: NXDOMAIN  
+
+POST /pause: 202 {}
+State after pause wait (67.75s): {'state': 'Paused', 'reason': 'Suspended', 'message': 'Sandbox is paused; set spec.state=Running to resume from the checkpoint', 'lastTransitionAt': '2026-11-26T06:29:40Z'}
+GET /health while Paused (old route): 503 
+POST /resume: 202 {}
+State after resume wait (0.56s): {'state': 'Running', 'reason': 'Ready', 'message': 'Runtime, data plane, Infra Components, and Action Bindings are Ready', 'lastTransitionAt': '2026-11-26T06:30:56Z'}
+GET endpoint after resume: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1tYWlu.49983.a.-wOKImKLloToX3V1DuxL6w'}}
+Wrong token after resume: 401 {"code":401,"message":"unauthorized access, please provide a valid access token or method signing if supported"}
+
+POST-RESUME exec: 200 host_utc_now= 1795674659 end= {'exited': True, 'status': 'exit status 0'}
+SENTINEL=p13-sentinel-v1
+COUNTER_POST_1=3 1795674580
+COUNTER_POST_2=5 1795674582
+PS_COUNTER=1
+ENV_POST=alive-across-pause|1
+GUEST_UTC_POST=1795674582
+NS_EXAMPLE=Server:		172.30.0.1 Address:	172.30.0.1#53  Non-authoritative answer: Name:	example.com Address: 172.66.147.243 Name:	example.com Address: 104.20.23.154 Name:	example.com Address: 2606:4700:10::ac42:93f3 Name:	example.com Address: 2606:4700:10::6814:179a  
+NS_HTTPBIN=;; Got recursion not available from 172.30.0.1 Server:		172.30.0.1 Address:	172.30.0.1#53  ** server can't find httpbin.org: NXDOMAIN  
+
+POST /init (same-token clock sync): 204  host_utc= 2026-11-26T06:30:59Z
+POST-SYNC exec: 200 host_utc_now= 1795674659
+GUEST_UTC_SYNCED=1795674659
+ENV_SYNCED=alive-across-pause|1
+

@@ -1,0 +1,9 @@
+GET endpoint: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1jcm9zcw.49983.a.s9FzNsj4ZxjUr-sNB-BLXg'}}
+POST /init (attempt=1): 204 host_utc= 2026-11-26T06:35:39Z
+PREP exec: 200 end= {'exited': True, 'status': 'exit status 0'}
+SENTINEL=p13-cross-sentinel
+COUNTER_PRE=2 1795674940
+ENV_PRE=cross-fastlet|2
+
+POST /pause: 202 {}
+Paused in 63.67s: {'state': 'Paused', 'reason': 'Suspended', 'message': 'Sandbox is paused; set spec.state=Running to resume from the checkpoint', 'lastTransitionAt': '2026-11-26T06:35:41Z'}

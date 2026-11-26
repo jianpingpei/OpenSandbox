@@ -1,0 +1,2 @@
+I1126 06:31:23.913888       1 driver.go:257] "firecracker image cache GC removed unreferenced images" digests=["10524c0826b26d0a12c928549a66dd13b1e5ccd35f85c5d36220dfe81414fbe9","5fab6607c81d8745d83c41cd400b4889487f6400d3285c3218318d472f0ba3ae"]
+I1126 06:36:47.620915       1 driver.go:804] "firecracker sandbox created" sandboxID="03193650-c47d-4e9d-886c-4faed9f45f40" total="63.992856ms" acquire="344.842µs" rootfs="12.984426ms" rootfsMiB="5120.0" infra="3.805828ms" launch="20.651379ms" configure="4.732583ms" boot="640.449µs" vmStatePolls=1

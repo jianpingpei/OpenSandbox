@@ -1,0 +1,16 @@
+GET endpoint fsb-p13-clone-a: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1jbG9uZS1h.49983.a.xRZpWBNJvZWWK31ryLFDFQ'}}
+GET endpoint fsb-p13-clone-b: 200 {'endpoint': '172.23.0.4:30881', 'headers': {'OpenSandbox-Ingress-To': 'f1.b3BlbnNhbmRib3gtZGF0YXBsYW5l.ZnNiLXAxMy1jbG9uZS1i.49983.a.2fdJ4W7xf3dSjslHQG3L4g'}}
+POST /init fsb-p13-clone-a (attempt=1): 204
+POST /init fsb-p13-clone-b (attempt=1): 204
+ISO [clone-a with token-clone-b]: status=401 out='' err='{"code":401,"message":"unauthorized access, please provide a valid access token or method signing if supported"}' end=None
+ISO [clone-b with token-clone-a]: status=401 out='' err='{"code":401,"message":"unauthorized access, please provide a valid access token or method signing if supported"}' end=None
+ISO [clone-a with token-clone-a]: status=200 out='CLONE_ID=A' err='' end={'exited': True, 'status': 'exit status 0'}
+ISO [clone-b with token-clone-b]: status=200 out='CLONE_ID=B' err='' end={'exited': True, 'status': 'exit status 0'}
+KILL envd exception (expected connection drop): IncompleteRead: IncompleteRead(36 bytes read)
+post-crash GET /health (unauth): status=503 body=''
+post-crash GET /metrics (unauth): status=503 body=''
+post-crash GET /metrics (token-clone-a): status=503 body=''
+post-crash exec (unauth): status=503 out='' err='' end=None
+post-crash exec (token-clone-a): status=503 out='' err='' end=None
+=== Sandbox fsb-p13-clone-a status after envd kill ===
+{"actionBindings":[{"handler":"egress","lastTransitionTime":"2026-11-26T06:44:22Z","state":"Ready"}],"conditions":[{"lastTransitionTime":"2026-11-26T06:44:22Z","message":"Sandbox resources are admissible under the Pool policy","observedGeneration":1,"reason":"Resolved","status":"True","type":"ResourceResolved"},{"lastTransitionTime":"2026-11-26T06:44:22Z","message":"Runtime, data plane, Infra Components, and Action Bindings are Ready","observedGeneration":1,"reason":"Ready","status":"True","type":"Ready"}],"dataPlane":{"lastTransitionTime":"2026-11-26T06:44:22Z","routeGeneration":1,"state":"Ready"},"infraComponents":[{"lastTransitionTime":"2026-11-26T06:44:22Z","name":"egress","state":"Ready"}],"observedGeneration":1,"placement":{"attempt":1,"fastletName":"firecracker-egress-pool-fastlet-64kf8","fastletPodUID":"80818032-d2a5-4d28-a6c1-a95d628abddd"},"runtime":{"generation":1,"lastTransitionTime":"2026-11-26T06:44:22Z","state":"Ready"}}
